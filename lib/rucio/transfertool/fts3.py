@@ -158,7 +158,7 @@ class FTS3Transfertool(Transfertool):
             # Multi_VO mode
             for transfer_file in files:
 
-                vo_name = job_params['account'].vo
+                vo_name = transfer_file['scope'].vo
                 if vo_name not in vo_list:
                     vo_list.append(vo_name)
                     vo_sorted_files[vo_name] = []
