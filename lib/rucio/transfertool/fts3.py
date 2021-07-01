@@ -29,6 +29,7 @@
 # - Joaquín Bogado <jbogado@linti.unlp.edu.ar>, 2020
 # - Jaroslav Guenther <jaroslav.guenther@cern.ch>, 2019
 # - Thomas Beermann <thomas.beermann@cern.ch>, 2020
+# - Timothy Noble <timothy.noble@stfc.ac.uk>, 2020
 
 from __future__ import absolute_import, division
 import datetime
