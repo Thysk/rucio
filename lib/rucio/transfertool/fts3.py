@@ -93,7 +93,12 @@ class FTS3Transfertool(Transfertool):
         :param external_host:   The external host where the transfertool API is running
         :param token: optional parameter to pass user's JWT
         """
-        usercert = config_get('conveyor', 'usercert', False, None)
+        if config_get_bool('common', 'multi_vo', False, None):
+            self.multi_vo = True
+            usercert = None
+        else:
+            self.multi_vo = False
+            usercert = config_get('conveyor', 'usercert', False, None)
 
         # token for OAuth 2.0 OIDC authorization scheme (working only with dCache + davs/https protocols as of Sep 2019)
         self.token = token
