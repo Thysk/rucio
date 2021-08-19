@@ -31,13 +31,9 @@
 # - Eli Chadwick <eli.chadwick@stfc.ac.uk>, 2020
 # - Nick Smith <nick.smith@cern.ch>, 2020
 # - Patrick Austin <patrick.austin@stfc.ac.uk>, 2020
-# - Benedikt Ziemons <benedikt.ziemons@cern.ch>, 2020-2021
+# - Benedikt Ziemons <benedikt.ziemons@cern.ch>, 2020
 # - Thomas Beermann <thomas.beermann@cern.ch>, 2021
-# - Rahul Chauhan <omrahulchauhan@gmail.com>, 2021
 # - Radu Carpa <radu.carpa@cern.ch>, 2021
-# - Sahan Dilshan <32576163+sahandilshan@users.noreply.github.com>, 2021
-# - Petr Vokac <petr.vokac@fjfi.cvut.cz>, 2021
-# - David Población Criado <david.poblacion.criado@cern.ch>, 2021
 
 from __future__ import division
 
@@ -46,44 +42,62 @@ import datetime
 import json
 import logging
 import re
+import sys
 import time
-from heapq import heappop, heappush
 from typing import TYPE_CHECKING
 
 from dogpile.cache import make_region
 from dogpile.cache.api import NoValue
-from sqlalchemy import and_, update
+from sqlalchemy import and_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.sql.expression import false
 
 from rucio.common import constants
-from rucio.common.config import config_get, config_get_bool
-from rucio.common.constants import SUPPORTED_PROTOCOLS, FTS_STATE
+from rucio.common.config import config_get
+from rucio.common.constants import SUPPORTED_PROTOCOLS
 from rucio.common.exception import (InvalidRSEExpression, NoDistance,
                                     RequestNotFound, RSEProtocolNotSupported,
                                     RucioException, UnsupportedOperation)
-from rucio.common.extra import import_extras
 from rucio.common.rse_attributes import get_rse_attributes
+from rucio.common.types import InternalAccount
 from rucio.common.utils import construct_surl
 from rucio.core import did, message as message_core, request as request_core
 from rucio.core.config import get as core_config_get
 from rucio.core.monitor import record_counter, record_timer
 from rucio.core.oidc import get_token_for_account_operation
-from rucio.core.replica import add_replicas, tombstone_from_delay
+from rucio.core.replica import add_replicas
 from rucio.core.request import queue_requests, set_requests_state
-from rucio.core.rse import get_rse_name, get_rse_vo, list_rses, get_rse_supported_checksums_from_attributes
+from rucio.core.rse import get_rse_name, get_rse_vo, list_rses, get_rse_supported_checksums
 from rucio.core.rse_expression_parser import parse_expression
 from rucio.db.sqla import models, filter_thread_work
-from rucio.db.sqla.constants import DIDType, RequestState, RSEType, RequestType, ReplicaState
+from rucio.db.sqla.constants import DIDType, RequestState, FTSState, RSEType, RequestType, ReplicaState
 from rucio.db.sqla.session import read_session, transactional_session
 from rucio.rse import rsemanager as rsemgr
 from rucio.transfertool.fts3 import FTS3Transfertool
 from rucio.transfertool.mock import MockTransfertool
 
 if TYPE_CHECKING:
-    from typing import List
+    from typing import List, Tuple
 
-EXTRA_MODULES = import_extras(['globus_sdk'])
+# Extra modules: Only imported if available
+EXTRA_MODULES = {'globus_sdk': False}
+
+for extra_module in EXTRA_MODULES:
+    if sys.version_info < (3, 5):
+        try:
+            import imp
+            imp.find_module(extra_module)
+            EXTRA_MODULES[extra_module] = True
+        except ImportError:
+            EXTRA_MODULES[extra_module] = False
+
+    else:
+        try:
+            import importlib
+            importlib.util.find_spec(extra_module)
+            EXTRA_MODULES[extra_module] = True
+        except ModuleNotFoundError:
+            EXTRA_MODULES[extra_module] = False
 
 if EXTRA_MODULES['globus_sdk']:
     from rucio.transfertool.globus import GlobusTransferTool  # pylint: disable=import-error
@@ -104,461 +118,8 @@ REQUEST_OIDC_AUDIENCE = config_get('conveyor', 'request_oidc_audience', False, '
 
 WEBDAV_TRANSFER_MODE = config_get('conveyor', 'webdav_transfer_mode', False, None)
 
-DEFAULT_MULTIHOP_TOMBSTONE_DELAY = datetime.timedelta(hours=2)
 
-
-class RseData:
-    """
-    Helper data class storing rse data grouped in one place.
-    """
-    def __init__(self, id_, name=None, attributes=None, info=None):
-        self.id = id_
-        self.name = name
-        self.attributes = attributes
-        self.info = info
-
-    def __str__(self):
-        if self.name is not None:
-            return "{}({})".format(self.name, self.id)
-        return self.id
-
-    def __eq__(self, other):
-        if other is None:
-            return False
-        return self.id == other.id
-
-    def is_tape(self):
-        if self.info['rse_type'] == RSEType.TAPE or self.info['rse_type'] == 'TAPE':
-            return True
-        return False
-
-    def is_tape_or_staging_required(self):
-        if self.is_tape() or self.attributes.get('staging_required', False):
-            return True
-        return False
-
-    @read_session
-    def load_name(self, session=None):
-        if self.name is None:
-            self.name = get_rse_name(rse_id=self.id, session=session)
-        return self.name
-
-    @read_session
-    def load_attributes(self, session=None):
-        if self.attributes is None:
-            self.attributes = get_rse_attributes(self.id, session=session)
-        return self.attributes
-
-    @read_session
-    def load_info(self, session=None):
-        if self.info is None:
-            self.info = rsemgr.get_rse_info(rse=self.load_name(session=session),
-                                            vo=get_rse_vo(rse_id=self.id, session=session),
-                                            session=session)
-        return self.info
-
-
-class TransferSource:
-    def __init__(self, rse_data, source_ranking=None, distance_ranking=None, file_path=None, scheme=None):
-        self.rse = rse_data
-        self.distance_ranking = distance_ranking if distance_ranking is not None else 9999
-        self.source_ranking = source_ranking if source_ranking is not None else 0
-        self.file_path = file_path
-        self.scheme = scheme
-
-    def __str__(self):
-        return "source rse={}".format(self.rse)
-
-
-class TransferDestination:
-    def __init__(self, rse_data, scheme):
-        self.rse = rse_data
-        self.scheme = scheme
-
-    def __str__(self):
-        return "destination rse={}".format(self.rse)
-
-
-class RequestWithSources:
-    def __init__(self, id_, rule_id, scope, name, md5, adler32, byte_count, activity, attributes,
-                 previous_attempt_id, dest_rse_data, account, retry_count):
-
-        self.request_id = id_
-        self.rule_id = rule_id
-        self.scope = scope
-        self.name = name
-        self.md5 = md5
-        self.adler32 = adler32
-        self.byte_count = byte_count
-        self.activity = activity
-        self._dict_attributes = None
-        self._db_attributes = attributes
-        self.previous_attempt_id = previous_attempt_id
-        self.dest_rse = dest_rse_data
-        self.account = account
-        self.retry_count = retry_count or 0
-
-        self.sources = []
-
-    def __str__(self):
-        return "request {}:{}({})".format(self.scope, self.name, self.request_id)
-
-    @property
-    def attributes(self):
-        if self._dict_attributes is None:
-            self.attributes = self._db_attributes
-        return self._dict_attributes
-
-    @attributes.setter
-    def attributes(self, db_attributes):
-        attr = {}
-        if db_attributes:
-            if isinstance(db_attributes, dict):
-                attr = json.loads(json.dumps(db_attributes))
-            else:
-                attr = json.loads(str(db_attributes))
-            # parse source expression
-            attr['source_replica_expression'] = attr["source_replica_expression"] if (attr and "source_replica_expression" in attr) else None
-            attr['allow_tape_source'] = attr["allow_tape_source"] if (attr and "allow_tape_source" in attr) else True
-            attr['dsn'] = attr["ds_name"] if (attr and "ds_name" in attr) else None
-            attr['lifetime'] = attr.get('lifetime', -1)
-        self._dict_attributes = attr
-
-
-class _RseLoaderContext:
-    """
-    Helper private class used to dynamically load and cache the rse information
-    """
-    def __init__(self, session):
-        self.session = session
-        self.rse_id_to_data_map = {}
-
-    def rse_data(self, rse_id):
-        rse_data = self.rse_id_to_data_map.get(rse_id)
-        if rse_data is None:
-            rse_data = RseData(rse_id)
-            rse_data.load_name(session=self.session)
-            rse_data.load_info(session=self.session)
-            rse_data.load_attributes(session=self.session)
-            self.rse_id_to_data_map[rse_id] = rse_data
-        return rse_data
-
-    def ensure_fully_loaded(self, rse_data):
-        if rse_data.name is None or rse_data.info is None or rse_data.attributes is None:
-            cached_rse_data = self.rse_data(rse_data.id)
-            if rse_data.name is None:
-                rse_data.name = cached_rse_data.name
-            if rse_data.info is None:
-                rse_data.info = cached_rse_data.info
-            if rse_data.attributes is None:
-                rse_data.attributes = cached_rse_data.attributes
-
-
-class ProtocolFactory:
-    """
-    Creates and caches protocol objects. Allowing to reuse them.
-    """
-    def __init__(self):
-        self.protocols = {}
-
-    def protocol(self, rse_data, scheme, operation):
-        protocol_key = '%s_%s_%s' % (operation, rse_data.id, scheme)
-        protocol = self.protocols.get(protocol_key)
-        if not protocol:
-            protocol = rsemgr.create_protocol(rse_data.info, operation, scheme)
-            self.protocols[protocol_key] = protocol
-        return protocol
-
-
-class DirectTransferDefinition:
-    """
-    The configuration for a direct (non-multi-hop) transfer. It can be a multi-source transfer.
-
-    The class wraps the legacy dict-based transfer definition to maintain compatibility with existing code
-    during the migration.
-    """
-    def __init__(self, source, destination, rws, protocol_factory, legacy_definition=None):
-        self.sources = [source]
-        self.destination = destination
-
-        self.rws = rws
-        self.protocol_factory = protocol_factory
-        self.legacy_def = legacy_definition or {}
-
-    def __str__(self):
-        return 'transfer {} from {} to {}'.format(self.rws, ' and '.join([str(s) for s in self.sources]), self.dst.rse)
-
-    @property
-    def src(self):
-        return self.sources[0]
-
-    @property
-    def dst(self):
-        return self.destination
-
-    def __setitem__(self, key, value):
-        self.legacy_def[key] = value
-
-    def __getitem__(self, key):
-        if key == 'dest_urls':
-            return [self._dest_url(self.dst, self.rws, self.protocol_factory)]
-        if key == 'sources':
-            return self.legacy_sources
-        if key == 'use_ipv4':
-            return self.use_ipv4
-        return self.legacy_def[key]
-
-    def get(self, key, default=None):
-        if key == 'dest_urls':
-            return [self._dest_url(self.dst, self.rws, self.protocol_factory)]
-        if key == 'sources':
-            return self.legacy_sources
-        if key == 'use_ipv4':
-            return self.use_ipv4
-        return self.legacy_def.get(key, default)
-
-    @property
-    def legacy_sources(self):
-        return [
-            (src.rse.name, self._source_url(src, self.dst, rws=self.rws, protocol_factory=self.protocol_factory), src.rse.id, src.source_ranking)
-            for src in self.sources
-        ]
-
-    @property
-    def use_ipv4(self):
-        # If any source or destination rse is ipv4 only
-        return self.dst.rse.attributes.get('use_ipv4', False) or any(src.rse.attributes.get('use_ipv4', False)
-                                                                     for src in self.sources)
-
-    @staticmethod
-    def __rewrite_source_url(source_url, source_sign_url, dest_sign_url, source_scheme):
-        """
-        Parametrize source url for some special cases of source and destination schemes
-        """
-        if dest_sign_url == 'gcs':
-            if source_scheme in ['davs', 'https']:
-                source_url += '?copy_mode=push'
-        elif dest_sign_url == 's3':
-            if source_scheme in ['davs', 'https']:
-                source_url += '?copy_mode=push'
-        elif WEBDAV_TRANSFER_MODE:
-            if source_scheme in ['davs', 'https']:
-                source_url += '?copy_mode=%s' % WEBDAV_TRANSFER_MODE
-
-        source_sign_url_map = {'gcs': 'gclouds', 's3': 's3s'}
-        if source_sign_url in source_sign_url_map:
-            if source_url[:7] == 'davs://':
-                source_url = source_sign_url_map[source_sign_url] + source_url[4:]
-            if source_url[:8] == 'https://':
-                source_url = source_sign_url_map[source_sign_url] + source_url[5:]
-
-        if source_url[:12] == 'srm+https://':
-            source_url = 'srm' + source_url[9:]
-        return source_url
-
-    @staticmethod
-    def __rewrite_dest_url(dest_url, dest_sign_url):
-        """
-        Parametrize destination url for some special cases of destination schemes
-        """
-        if dest_sign_url == 'gcs':
-            dest_url = re.sub('davs', 'gclouds', dest_url)
-            dest_url = re.sub('https', 'gclouds', dest_url)
-        elif dest_sign_url == 's3':
-            dest_url = re.sub('davs', 's3s', dest_url)
-            dest_url = re.sub('https', 's3s', dest_url)
-
-        if dest_url[:12] == 'srm+https://':
-            dest_url = 'srm' + dest_url[9:]
-        return dest_url
-
-    @classmethod
-    def _source_url(cls, src, dst, rws, protocol_factory):
-        """
-        Generate the source url which will be used as origin to copy the file from request rws towards the given dst endpoint
-        """
-        # Get source protocol
-        protocol = protocol_factory.protocol(src.rse, src.scheme, 'third_party_copy')
-
-        # Compute the source URL
-        source_sign_url = src.rse.attributes.get('sign_url', None)
-        dest_sign_url = dst.rse.attributes.get('sign_url', None)
-        source_url = list(protocol.lfns2pfns(lfns={'scope': rws.scope.external, 'name': rws.name, 'path': src.file_path}).values())[0]
-        source_url = cls.__rewrite_source_url(source_url, source_sign_url=source_sign_url, dest_sign_url=dest_sign_url, source_scheme=src.scheme)
-        return source_url
-
-    @classmethod
-    def _dest_url(cls, dst, rws, protocol_factory):
-        """
-        Generate the destination url for copying the file of request rws
-        """
-        # Get destination protocol
-        protocol = protocol_factory.protocol(dst.rse, dst.scheme, 'third_party_copy')
-
-        if dst.rse.info['deterministic']:
-            dest_url = list(protocol.lfns2pfns(lfns={'scope': rws.scope.external, 'name': rws.name}).values())[0]
-        else:
-            # compute dest url in case of non deterministic
-            # naming convention, etc.
-            dsn = get_dsn(rws.scope, rws.name, rws.attributes.get('dsn', None))
-            # DQ2 path always starts with /, but prefix might not end with /
-            naming_convention = dst.rse.attributes.get('naming_convention', None)
-            dest_path = construct_surl(dsn, rws.name, naming_convention)
-            if dst.rse.is_tape():
-                if rws.retry_count or rws.activity == 'Recovery':
-                    dest_path = '%s_%i' % (dest_path, int(time.time()))
-
-            dest_url = list(protocol.lfns2pfns(lfns={'scope': rws.scope.external, 'name': rws.name, 'path': dest_path}).values())[0]
-
-        dest_sign_url = dst.rse.attributes.get('sign_url', None)
-        dest_url = cls.__rewrite_dest_url(dest_url, dest_sign_url=dest_sign_url)
-        return dest_url
-
-    def init_legacy_transfer_definition(self, bring_online, logger):
-        """
-        initialize the legacy transfer definition:
-        a dictionary with transfer parameters which were not yet migrated to the new, class-based, model
-        """
-
-        if self.legacy_def:
-            return
-
-        src = self.src
-        dst = self.dst
-        rws = self.rws
-
-        # Extend the metadata dictionary with request attributes
-        transfer_src_type = "DISK"
-        transfer_dst_type = "DISK"
-        overwrite, bring_online_local = True, None
-        if src.rse.is_tape_or_staging_required():
-            bring_online_local = bring_online
-            transfer_src_type = "TAPE"
-        if dst.rse.is_tape():
-            overwrite = False
-            transfer_dst_type = "TAPE"
-
-        # Get dest space token
-        dest_protocol = self.protocol_factory.protocol(dst.rse, dst.scheme, 'third_party_copy')
-        dest_spacetoken = None
-        if dest_protocol.attributes and 'extended_attributes' in dest_protocol.attributes and \
-                dest_protocol.attributes['extended_attributes'] and 'space_token' in dest_protocol.attributes['extended_attributes']:
-            dest_spacetoken = dest_protocol.attributes['extended_attributes']['space_token']
-
-        # get external_host + strict_copy + archive timeout
-        strict_copy = dst.rse.attributes.get('strict_copy', False)
-        archive_timeout = dst.rse.attributes.get('archive_timeout', None)
-
-        # Fill the transfer dictionary including file_metadata
-        file_metadata = {'request_id': rws.request_id,
-                         'scope': rws.scope,
-                         'name': rws.name,
-                         'activity': rws.activity,
-                         'request_type': RequestType.TRANSFER,
-                         'src_type': transfer_src_type,
-                         'dst_type': transfer_dst_type,
-                         'src_rse': src.rse.name,
-                         'dst_rse': dst.rse.name,
-                         'src_rse_id': src.rse.id,
-                         'dest_rse_id': dst.rse.id,
-                         'filesize': rws.byte_count,
-                         'md5': rws.md5,
-                         'adler32': rws.adler32}
-        transfer = {'request_id': rws.request_id,
-                    'account': rws.account,
-                    'src_spacetoken': None,
-                    'dest_spacetoken': dest_spacetoken,
-                    'overwrite': overwrite,
-                    'bring_online': bring_online_local,
-                    'copy_pin_lifetime': rws.attributes.get('lifetime', 172800),
-                    'selection_strategy': 'auto',
-                    'rule_id': rws.rule_id,
-                    'file_metadata': file_metadata}
-        if strict_copy:
-            transfer['strict_copy'] = strict_copy
-        if archive_timeout and dst.rse.is_tape():
-            try:
-                transfer['archive_timeout'] = int(archive_timeout)
-                logger(logging.DEBUG, 'Added archive timeout to transfer.')
-            except ValueError:
-                logger(logging.WARNING, 'Could not set archive_timeout for %s. Must be integer.', self)
-                pass
-
-        self.legacy_def = transfer
-
-
-def oidc_supported(transfer_hop):
-    """
-    checking OIDC AuthN/Z support per destination and source RSEs;
-
-    for oidc_support to be activated, all sources and the destination must explicitly support it
-    """
-    # assumes use of boolean 'oidc_support' RSE attribute
-    if not transfer_hop.dst.rse.attributes.get('oidc_support', False):
-        return False
-
-    for source in transfer_hop.sources:
-        if not source.rse.attributes.get('oidc_support', False):
-            return False
-    return True
-
-
-def checksum_validation_strategy(src_attributes, dst_attributes, logger):
-    """
-    Compute the checksum validation strategy (none, source, destination or both) and the
-    supported checksums from the attributes of the source and destination RSE.
-    """
-    source_supported_checksums = get_rse_supported_checksums_from_attributes(src_attributes)
-    dest_supported_checksums = get_rse_supported_checksums_from_attributes(dst_attributes)
-    common_checksum_names = set(source_supported_checksums).intersection(dest_supported_checksums)
-
-    verify_checksum = 'both'
-    if not dst_attributes.get('verify_checksum', True):
-        if not src_attributes.get('verify_checksum', True):
-            verify_checksum = 'none'
-        else:
-            verify_checksum = 'source'
-    else:
-        if not src_attributes.get('verify_checksum', True):
-            verify_checksum = 'destination'
-        else:
-            verify_checksum = 'both'
-
-    if len(common_checksum_names) == 0:
-        logger(logging.INFO, 'No common checksum method. Verifying destination only.')
-        verify_checksum = 'destination'
-
-    if source_supported_checksums == ['none']:
-        if dest_supported_checksums == ['none']:
-            # both endpoints support none
-            verify_checksum = 'none'
-        else:
-            # src supports none but dst does
-            verify_checksum = 'destination'
-    else:
-        if dest_supported_checksums == ['none']:
-            # source supports some but destination does not
-            verify_checksum = 'source'
-        else:
-            if len(common_checksum_names) == 0:
-                # source and dst support some bot none in common (dst priority)
-                verify_checksum = 'destination'
-            else:
-                # Don't override the value in the file_metadata
-                pass
-
-    checksums_to_use = ['none']
-    if verify_checksum == 'both':
-        checksums_to_use = common_checksum_names
-    elif verify_checksum == 'source':
-        checksums_to_use = source_supported_checksums
-    elif verify_checksum == 'destination':
-        checksums_to_use = dest_supported_checksums
-
-    return verify_checksum, checksums_to_use
-
-
-def submit_bulk_transfers(external_host, files, transfertool='fts3', job_params={}, timeout=None, logger=logging.log, vo=None):
+def submit_bulk_transfers(external_host, files, transfertool='fts3', job_params={}, timeout=None, user_transfer_job=False, logger=logging.log):
     """
     Submit transfer request to a transfertool.
     :param external_host:  External host name as string
@@ -605,7 +166,7 @@ def submit_bulk_transfers(external_host, files, transfertool='fts3', job_params=
                 if 'token' in token_dict:
                     logger(logging.DEBUG, 'Access token used as transfer token.')
                     transfer_token = token_dict['token']
-        transfer_id = FTS3Transfertool(external_host=external_host, token=transfer_token, vo=vo).submit(files=job_files, job_params=job_params, timeout=timeout)
+        transfer_id = FTS3Transfertool(external_host=external_host, token=transfer_token).submit(files=job_files, job_params=job_params, timeout=timeout)
         record_timer('core.request.submit_transfers_fts3', (time.time() - start_time) * 1000 / len(files))
     elif transfertool == 'globus':
         logger(logging.DEBUG, '... Starting globus xfer ...')
@@ -648,7 +209,7 @@ def prepare_sources_for_transfers(transfers, session=None):
                                        'submitted_at': datetime.datetime.utcnow()},
                                       synchronize_session=False)
             if rowcount == 0:
-                raise RequestNotFound("Failed to prepare transfer: request %s does not exist or is not in queued state" % request_id)
+                raise RequestNotFound("Failed to prepare transfer: request %s does not exist or is not in queued state" % (request_id))
 
             if 'file' in transfers[request_id]:
                 file = transfers[request_id]['file']
@@ -729,7 +290,7 @@ def set_transfers_state(transfers, submitted_at, session=None):
         raise RucioException(error.args)
 
 
-def bulk_query_transfers(request_host, transfer_ids, transfertool='fts3', timeout=None, logger=logging.log):
+def bulk_query_transfers(request_host, transfer_ids, transfertool='fts3', timeout=None, logger=logging.log, vo=None):
     """
     Query the status of a transfer.
     :param request_host:  Name of the external host.
@@ -744,41 +305,20 @@ def bulk_query_transfers(request_host, transfer_ids, transfertool='fts3', timeou
     if transfertool == 'fts3':
         try:
             start_time = time.time()
-            fts_resps = FTS3Transfertool(external_host=request_host).bulk_query(transfer_ids=transfer_ids, timeout=timeout)
+            fts_resps = FTS3Transfertool(external_host=request_host, vo=vo).bulk_query(transfer_ids=transfer_ids, timeout=timeout)
             record_timer('core.request.bulk_query_transfers', (time.time() - start_time) * 1000 / len(transfer_ids))
         except Exception:
             raise
 
-        fts_resp_list = []
-        for fts_resp in fts_resps:
-            fts_resp_list.append(fts_resp)
+        if vo:
+            for vo in transfer_ids:
+                for transfer_id in transfer_ids[vo]:
+                    fts_resps = __return_fts_states_for_transfer_id(transfer_id, fts_resps)
+        else:
+            for transfer_id in transfer_ids:
+                fts_resps = __return_fts_states_for_transfer_id(transfer_id, fts_resps)
+                return fts_resps
 
-        if config_get_bool('common', 'multi_vo', False, None):
-            _transfer_ids = []
-            for _transfer_id in transfer_ids:
-                id, vo = _transfer_id.split('@')
-                _transfer_ids.append(id)
-            transfer_ids = _transfer_ids
-
-        for transfer_id in transfer_ids:
-            if transfer_id not in fts_resps:
-                fts_resps[transfer_id] = Exception("Transfer id %s is not returned" % transfer_id)
-            if fts_resps[transfer_id] and not isinstance(fts_resps[transfer_id], Exception):
-                for request_id in fts_resps[transfer_id]:
-                    status_dict = fts_resps[transfer_id][request_id]
-                    job_state = status_dict['job_state']
-                    file_state = status_dict['file_state']
-                    if job_state in (FTS_STATE.FAILED, FTS_STATE.CANCELED):
-                        status_dict['new_state'] = RequestState.FAILED
-                    elif job_state == FTS_STATE.FINISHED:
-                        status_dict['new_state'] = RequestState.DONE
-                    elif job_state == FTS_STATE.FINISHEDDIRTY:
-                        # Job partially completed. Verify the state of the file in the job
-                        if file_state in (FTS_STATE.FAILED, FTS_STATE.CANCELED):
-                            status_dict['new_state'] = RequestState.FAILED
-                        elif file_state == FTS_STATE.FINISHED:
-                            status_dict['new_state'] = RequestState.DONE
-        return fts_resps
     elif transfertool == 'globus':
         try:
             start_time = time.time()
@@ -820,7 +360,42 @@ def set_transfer_update_time(external_host, transfer_id, update_time=datetime.da
         raise RucioException(error.args)
 
     if not rowcount:
-        raise UnsupportedOperation("Transfer %s doesn't exist or its status is not submitted." % transfer_id)
+        raise UnsupportedOperation("Transfer %s doesn't exist or its status is not submitted." % (transfer_id))
+
+
+def query_latest(external_host, state, last_nhours=1, logger=logging.log):
+    """
+    Query the latest transfers in last n hours with state.
+    :param external_host:  FTS host name as a string.
+    :param state:          FTS job state as a string or a dictionary.
+    :param last_nhours:    Latest n hours as an integer.
+    :param logger:         Optional decorated logger that can be passed from the calling daemons or servers.
+    :returns:              Requests status information as a dictionary.
+    """
+
+    record_counter('core.request.query_latest')
+
+    start_time = time.time()
+    resps = FTS3Transfertool(external_host=external_host).query_latest(state=state, last_nhours=last_nhours)
+    record_timer('core.request.query_latest_fts3.%s.%s_hours' % (external_host, last_nhours), (time.time() - start_time) * 1000)
+
+    if not resps:
+        return
+
+    ret_resps = []
+    for resp in resps:
+        if 'job_metadata' not in resp or resp['job_metadata'] is None or 'issuer' not in resp['job_metadata'] or resp['job_metadata']['issuer'] != 'rucio':
+            continue
+
+        if 'request_id' not in resp['job_metadata']:
+            # submitted by new submitter
+            try:
+                logger(logging.DEBUG, "Transfer %s on %s is %s, decrease its updated_at." % (resp['job_id'], external_host, resp['job_state']))
+                set_transfer_update_time(external_host, resp['job_id'], datetime.datetime.utcnow() - datetime.timedelta(hours=24))
+            except Exception as error:
+                logger(logging.DEBUG, "Exception happened when updating transfer updatetime: %s" % str(error).replace('\n', ''))
+
+    return ret_resps
 
 
 @transactional_session
@@ -836,13 +411,11 @@ def touch_transfer(external_host, transfer_id, session=None):
 
     try:
         # don't touch it if it's already touched in 30 seconds
-        stmt = update(models.Request).prefix_with("/*+ INDEX(REQUESTS REQUESTS_EXTERNALID_UQ) */", dialect='oracle')\
+        session.query(models.Request).with_hint(models.Request, "INDEX(REQUESTS REQUESTS_EXTERNALID_UQ)", 'oracle')\
                                      .filter_by(external_id=transfer_id)\
-                                     .where(models.Request.state == RequestState.SUBMITTED)\
-                                     .where(models.Request.updated_at < datetime.datetime.utcnow() - datetime.timedelta(seconds=30))\
-                                     .execution_options(synchronize_session=False)\
-                                     .values(updated_at=datetime.datetime.utcnow())
-        session.execute(stmt)
+                                     .filter(models.Request.state == RequestState.SUBMITTED)\
+                                     .filter(models.Request.updated_at < datetime.datetime.utcnow() - datetime.timedelta(seconds=30))\
+                                     .update({'updated_at': datetime.datetime.utcnow()}, synchronize_session=False)
     except IntegrityError as error:
         raise RucioException(error.args)
 
@@ -861,9 +434,6 @@ def update_transfer_state(external_host, transfer_id, state, session=None, logge
     """
 
     try:
-        if config_get_bool('common', 'multi_vo', False, None):
-            transfer_id, vo = transfer_id.split('@')
-
         if state == RequestState.LOST:
             reqs = request_core.get_requests_by_transfer(external_host, transfer_id, session=session)
             for req in reqs:
@@ -935,241 +505,123 @@ def get_hops(source_rse_id, dest_rse_id, include_multihop=False, multihop_rses=N
     if not limit_dest_schemes:
         limit_dest_schemes = []
 
-    shortest_paths = __search_shortest_paths(source_rse_ids=[source_rse_id], dest_rse_id=dest_rse_id,
-                                             include_multihop=include_multihop, multihop_rses=multihop_rses,
-                                             limit_dest_schemes=limit_dest_schemes, session=session)
-
-    result = REGION_SHORT.get('get_hops_dist_%s_%s_%s' % (str(source_rse_id), str(dest_rse_id), ''.join(sorted(limit_dest_schemes))))
+    # Check if there is a cached result
+    result = REGION_SHORT.get('get_hops_%s_%s_%s' % (str(source_rse_id), str(dest_rse_id), ''.join(sorted(limit_dest_schemes))))
     if not isinstance(result, NoValue):
         return result
 
-    path = shortest_paths.get(source_rse_id)
-    if path is None:
-        raise NoDistance()
-
-    if not path:
-        raise RSEProtocolNotSupported()
-
-    REGION_SHORT.set('get_hops_dist_%s_%s_%s' % (str(source_rse_id), str(dest_rse_id), ''.join(sorted(limit_dest_schemes))), path)
-    return path
-
-
-def __search_shortest_paths(source_rse_ids, dest_rse_id, include_multihop, multihop_rses, limit_dest_schemes, inbound_links_by_node=None, session=None):
-    """
-    Find the shortest paths from multiple sources towards dest_rse_id.
-    Does a Backwards Dijkstra's algorithm: start from destination and follow inbound links towards the sources.
-    If multihop is disabled, stop after analysing direct connections to dest_rse. Otherwise, stops when all
-    sources where found or the graph was traversed in integrality.
-
-    The inbound links retrieved from the database can be accumulated into the inbound_links_by_node, passed
-    from the calling context. To be able to reuse them.
-    """
-    if not limit_dest_schemes:
-        limit_dest_schemes = []
-
-    if not include_multihop or multihop_rses is None:
+    if multihop_rses is None:
         multihop_rses = []
 
+    # TODO: Might be problematic to always load the distance_graph, since it might be expensiv
+
+    # Load the graph from the distances table
+    # distance_graph = __load_distance_graph(session=session)
+    distance_graph = {}
+    distance_graph[source_rse_id] = __load_outgoing_distances_node(rse_id=source_rse_id, session=session)
+
+    # 1. Check if there is a direct connection between source and dest:
+    if distance_graph.get(source_rse_id, {dest_rse_id: None}).get(dest_rse_id) is not None:
+        # Check if there is a protocol match between the two RSEs
+        try:
+            matching_scheme = rsemgr.find_matching_scheme(rse_settings_dest=__load_rse_settings(rse_id=dest_rse_id, session=session),
+                                                          rse_settings_src=__load_rse_settings(rse_id=source_rse_id, session=session),
+                                                          operation_src='third_party_copy',
+                                                          operation_dest='third_party_copy',
+                                                          domain='wan',
+                                                          scheme=limit_dest_schemes if limit_dest_schemes else None)
+            path = [{'source_rse_id': source_rse_id,
+                     'dest_rse_id': dest_rse_id,
+                     'source_scheme': matching_scheme[1],
+                     'dest_scheme': matching_scheme[0],
+                     'source_scheme_priority': matching_scheme[3],
+                     'dest_scheme_priority': matching_scheme[2]}]
+            REGION_SHORT.set('get_hops_%s_%s_%s' % (str(source_rse_id), str(dest_rse_id), ''.join(sorted(limit_dest_schemes))), path)
+            return path
+        except RSEProtocolNotSupported as error:
+            if include_multihop:
+                # Delete the edge from the graph
+                del distance_graph[source_rse_id][dest_rse_id]
+            else:
+                raise error
+
+    if not include_multihop:
+        raise NoDistance()
+
+    # 2. There is no connection or no scheme match --> Try a multi hop --> Dijkstra algorithm
     HOP_PENALTY = core_config_get('transfers', 'hop_penalty', default=10, session=session)  # Penalty to be applied to each further hop
 
-    if include_multihop:
-        # Filter out island source RSEs
-        sources_to_find = {rse_id for rse_id in source_rse_ids if __load_outgoing_distances_node(rse_id=rse_id, session=session)}
+    # Check if the destination RSE is an island RSE:
+    if not __load_inbound_distances_node(rse_id=dest_rse_id, session=session):
+        raise NoDistance()
+
+    visited_nodes = {source_rse_id: {'distance': 0,
+                                     'path': []}}  # Dijkstra already visisted nodes
+    # {rse_id: {'path': [{'source_rse_id':, 'dest_rse_id':, 'source_scheme', 'dest_scheme': }],
+    #           'distance': X}
+    # }
+    to_visit = [source_rse_id]  # Nodes to visit, once list is empty, break loop
+    local_optimum = 9999  # Local optimum to accelerated search
+
+    while to_visit:
+        for current_node in copy.deepcopy(to_visit):
+            to_visit.remove(current_node)
+            current_distance = visited_nodes[current_node]['distance']
+            current_path = visited_nodes[current_node]['path']
+
+            if current_node not in distance_graph:
+                distance_graph[current_node] = __load_outgoing_distances_node(rse_id=current_node, session=session)
+
+            for out_v in distance_graph[current_node]:
+                # Check if the distance would be smaller
+                if distance_graph[current_node][out_v] is None:
+                    continue
+                if visited_nodes.get(out_v, {'distance': 9999})['distance'] > current_distance + distance_graph[current_node][out_v] + HOP_PENALTY\
+                   and local_optimum > current_distance + distance_graph[current_node][out_v] + HOP_PENALTY:
+                    # Check if the intermediate RSE is enabled for multihop
+                    if out_v != dest_rse_id and out_v not in multihop_rses:
+                        continue
+                    # Check if there is a compatible protocol pair
+                    try:
+                        matching_scheme = rsemgr.find_matching_scheme(rse_settings_dest=__load_rse_settings(rse_id=out_v, session=session),
+                                                                      rse_settings_src=__load_rse_settings(rse_id=current_node, session=session),
+                                                                      operation_src='third_party_copy',
+                                                                      operation_dest='third_party_copy',
+                                                                      domain='wan',
+                                                                      scheme=limit_dest_schemes if out_v == dest_rse_id and limit_dest_schemes else None)
+                        visited_nodes[out_v] = {'distance': current_distance + distance_graph[current_node][out_v] + HOP_PENALTY,
+                                                'path': current_path + [{'source_rse_id': current_node,
+                                                                         'dest_rse_id': out_v,
+                                                                         'source_scheme': matching_scheme[1],
+                                                                         'dest_scheme': matching_scheme[0],
+                                                                         'source_scheme_priority': matching_scheme[3],
+                                                                         'dest_scheme_priority': matching_scheme[2]}]}
+                        if out_v != dest_rse_id:
+                            to_visit.append(out_v)
+                        else:
+                            local_optimum = current_distance + distance_graph[current_node][out_v] + HOP_PENALTY
+                    except RSEProtocolNotSupported:
+                        pass
+    if dest_rse_id in visited_nodes:
+        REGION_SHORT.set('get_hops_%s_%s_%s' % (str(source_rse_id), str(dest_rse_id), ''.join(sorted(limit_dest_schemes))), visited_nodes[dest_rse_id]['path'])
+        return visited_nodes[dest_rse_id]['path']
     else:
-        sources_to_find = set(source_rse_ids)
-
-    next_hop = {dest_rse_id: {'cumulated_distance': 0}}
-    priority_q = []
-
-    remaining_sources = copy.copy(sources_to_find)
-    heappush(priority_q, (0, dest_rse_id))
-    while priority_q:
-        pq_distance, current_node = heappop(priority_q)
-
-        current_distance = next_hop[current_node]['cumulated_distance']
-        if pq_distance > current_distance:
-            # Lazy deletion.
-            # We don't update the priorities in the queue. The same element can be found multiple times,
-            # with different priorities. Skip this element if it was already processed.
-            continue
-
-        if current_node in remaining_sources:
-            remaining_sources.remove(current_node)
-        if not remaining_sources:
-            # We found the shortest paths to all desired sources
-            break
-
-        inbound_links = __load_inbound_distances_node(rse_id=current_node, session=session)
-        if inbound_links_by_node is not None:
-            inbound_links_by_node[current_node] = inbound_links
-        for adjacent_node, link_distance in sorted(inbound_links.items(),
-                                                   key=lambda item: 0 if item[0] in sources_to_find else 1):
-            if link_distance is None:
-                continue
-
-            if adjacent_node not in remaining_sources and adjacent_node not in multihop_rses:
-                continue
-
-            new_adjacent_distance = current_distance + link_distance + HOP_PENALTY
-            if next_hop.get(adjacent_node, {}).get('cumulated_distance', 9999) <= new_adjacent_distance:
-                continue
-
-            try:
-                matching_scheme = rsemgr.find_matching_scheme(
-                    rse_settings_src=__load_rse_settings(rse_id=adjacent_node, session=session),
-                    rse_settings_dest=__load_rse_settings(rse_id=current_node, session=session),
-                    operation_src='third_party_copy',
-                    operation_dest='third_party_copy',
-                    domain='wan',
-                    scheme=limit_dest_schemes if adjacent_node == dest_rse_id and limit_dest_schemes else None
-                )
-                next_hop[adjacent_node] = {
-                    'source_rse_id': adjacent_node,
-                    'dest_rse_id': current_node,
-                    'source_scheme': matching_scheme[1],
-                    'dest_scheme': matching_scheme[0],
-                    'source_scheme_priority': matching_scheme[3],
-                    'dest_scheme_priority': matching_scheme[2],
-                    'hop_distance': link_distance,
-                    'cumulated_distance': new_adjacent_distance,
-                }
-                heappush(priority_q, (new_adjacent_distance, adjacent_node))
-            except RSEProtocolNotSupported:
-                if next_hop.get(adjacent_node) is None:
-                    next_hop[adjacent_node] = {}
-
-        if not include_multihop:
-            # Stop after the first iteration, which finds direct connections to destination
-            break
-
-    paths = {}
-    for rse_id in source_rse_ids:
-        hop = next_hop.get(rse_id)
-        if hop is None:
-            continue
-
-        path = []
-        while hop.get('dest_rse_id'):
-            path.append(hop)
-            hop = next_hop.get(hop['dest_rse_id'])
-        paths[rse_id] = path
-    return paths
+        raise NoDistance()
 
 
-@read_session
-def __create_transfer_definitions(ctx, rws, sources, include_multihop, multihop_rses, limit_dest_schemes, session=None):
-    """
-    Find the all paths from sources towards the destination of the given transfer request.
-    Create the transfer definitions for each point-to-point transfer (multi-source, when possible)
-    """
-    protocol_factory = ProtocolFactory()
-    inbound_links_by_node = {}
-    shortest_paths = __search_shortest_paths(source_rse_ids=[s.rse.id for s in sources], dest_rse_id=rws.dest_rse.id,
-                                             include_multihop=include_multihop, multihop_rses=multihop_rses,
-                                             limit_dest_schemes=limit_dest_schemes,
-                                             inbound_links_by_node=inbound_links_by_node, session=session)
-
-    transfers_by_source = {}
-    sources_by_rse_id = {s.rse.id: s for s in sources}
-    paths_by_source = {sources_by_rse_id[rse_id]: path for rse_id, path in shortest_paths.items()}
-    for source, list_hops in paths_by_source.items():
-        transfer_path = []
-        for hop in list_hops:
-            hop_src_rse = ctx.rse_data(hop['source_rse_id'])
-            hop_dst_rse = ctx.rse_data(hop['dest_rse_id'])
-            src = TransferSource(
-                rse_data=hop_src_rse,
-                file_path=source.file_path if hop_src_rse == source.rse else None,
-                source_ranking=source.source_ranking if hop_src_rse == source.rse else 0,
-                distance_ranking=hop['cumulated_distance'] if hop_src_rse == source.rse else hop['hop_distance'],
-                scheme=hop['source_scheme'],
-            )
-            dst = TransferDestination(
-                rse_data=hop_dst_rse,
-                scheme=hop['dest_scheme'],
-            )
-            hop_definition = DirectTransferDefinition(
-                source=src,
-                destination=dst,
-                # keep the current rws for last hop; create a new one for other hops
-                rws=rws if hop_dst_rse == rws.dest_rse else RequestWithSources(
-                    id_=None,
-                    rule_id=None,
-                    scope=rws.scope,
-                    name=rws.name,
-                    md5=rws.md5,
-                    adler32=rws.adler32,
-                    byte_count=rws.byte_count,
-                    activity=rws.activity,
-                    attributes={
-                        'activity': rws.activity,
-                        'source_replica_expression': None,
-                        'lifetime': None,
-                        'ds_scope': None,
-                        'ds_name': None,
-                        'bytes': rws.byte_count,
-                        'md5': rws.md5,
-                        'adler32': rws.adler32,
-                        'priority': None,
-                        'allow_tape_source': True
-                    },
-                    previous_attempt_id=None,
-                    dest_rse_data=hop_dst_rse,
-                    account=rws.account,
-                    retry_count=0,
-                ),
-                protocol_factory=protocol_factory,
-            )
-
-            transfer_path.append(hop_definition)
-        transfers_by_source[source.rse.id] = transfer_path
-
-    # create multi-source transfers: add additional sources if possible
-    for transfer_path in transfers_by_source.values():
-        if len(transfer_path) == 1 and not transfer_path[0].src.rse.is_tape():
-            # Multiple single-hop DISK rses can be used together in "multi-source" transfers
-            #
-            # Try adding additional single-hop DISK rses sources to the transfer
-            inbound_links = inbound_links_by_node[transfer_path[0].dst.rse.id]
-            main_source_schemes = __add_compatible_schemes(schemes=[transfer_path[0].dst.scheme], allowed_schemes=SUPPORTED_PROTOCOLS)
-            added_sources = 0
-            for source in sorted(sources, key=lambda s: (-s.source_ranking, s.distance_ranking)):
-                if added_sources >= 5:
-                    break
-
-                if source.rse.id not in inbound_links:
-                    # There is no direct connection between this source and the destination
-                    continue
-
-                if source.rse == transfer_path[0].src.rse:
-                    # This is the main source. Don't add a duplicate.
-                    continue
-
-                if source.rse.is_tape():
-                    continue
-
-                try:
-                    matching_scheme = rsemgr.find_matching_scheme(
-                        rse_settings_src=source.rse.info,
-                        rse_settings_dest=transfer_path[0].dst.rse.info,
-                        operation_src='third_party_copy',
-                        operation_dest='third_party_copy',
-                        domain='wan',
-                        scheme=main_source_schemes)
-                except RSEProtocolNotSupported:
-                    continue
-
-                transfer_path[0].sources.append(
-                    TransferSource(
-                        rse_data=source.rse,
-                        file_path=source.file_path,
-                        source_ranking=source.source_ranking,
-                        distance_ranking=inbound_links[source.rse.id],
-                        scheme=matching_scheme[1],
-                    )
-                )
-                added_sources += 1
-    return transfers_by_source
+def get_attributes(attributes):
+    dict_attributes = {}
+    if attributes:
+        if isinstance(attributes, dict):
+            attr = json.loads(json.dumps(attributes))
+        else:
+            attr = json.loads(str(attributes))
+    # parse source expression
+    dict_attributes['source_replica_expression'] = attr["source_replica_expression"] if (attr and "source_replica_expression" in attr) else None
+    dict_attributes['allow_tape_source'] = attr["allow_tape_source"] if (attr and "allow_tape_source" in attr) else True
+    dict_attributes['dsn'] = attr["ds_name"] if (attr and "ds_name" in attr) else None
+    dict_attributes['lifetime'] = attr.get('lifetime', -1)
+    return dict_attributes
 
 
 def get_dsn(scope, name, dsn):
@@ -1182,93 +634,69 @@ def get_dsn(scope, name, dsn):
     return 'other'
 
 
-def __filter_unwanted_paths(candidate_paths):
-
-    # Discard multihop transfers which contain a tape source as an intermediate hop
-    filtered_candidate_paths = []
-    for path in candidate_paths:
-        if any(transfer.src.rse.is_tape_or_staging_required() for transfer in path[1:]):
-            continue
-        filtered_candidate_paths.append(path)
-    candidate_paths = filtered_candidate_paths
-
-    # Discard multihop transfers which contain other candidate as part of itself For example:
-    # if A->B->C and B->C are both candidates, discard A->B->C because it includes B->C. Doing B->C is enough.
-    source_rses = {path[0].src.rse.id for path in candidate_paths}
-    filtered_candidate_paths = []
-    for path in candidate_paths:
-        if any(hop.src.rse.id in source_rses for hop in path[1:]):
-            continue
-        filtered_candidate_paths.append(path)
-    candidate_paths = filtered_candidate_paths
-
-    yield from candidate_paths
-
-
-def __sort_paths(candidate_paths):
-
-    def __transfer_order_key(transfer_path):
-        # higher source_ranking first,
-        # on equal source_ranking, prefer DISK over TAPE
-        # on equal type, prefer lower distance_ranking
-        # on equal distance, prefer single hop
-        return (
-            - transfer_path[0].src.source_ranking,
-            transfer_path[0].src.rse.is_tape_or_staging_required(),  # rely on the fact that False < True
-            transfer_path[0].src.distance_ranking,
-            len(transfer_path) > 1,  # rely on the fact that False < True
-        )
-
-    yield from sorted(candidate_paths, key=__transfer_order_key)
-
-
-def __filter_for_transfertool_and_set_external_host(candidate_paths, rws, transfertool, retry_other_fts, logger):
+def __build_dest_url(scope, name, protocol, dest_rse_attrs, dest_is_deterministic, dest_is_tape, dict_attributes, retry_count, activity):
     """
-    Filter out paths which cannot be handled by the given transfertool (missing globus enpoint ids; no common fts server attribute; etc)
-    Set the external_host attribute on transfer definition.
+    Private helper function to build destination URL when retrieving transfers to execute.
     """
-    for transfer_path in candidate_paths:
 
-        external_host = ''
-        if transfertool == 'globus':
-            all_rses_have_globus_id = True
-            for hop in transfer_path:
-                source_globus_endpoint_id = hop.src.rse.attributes.get('globus_endpoint_id', None)
-                dest_globus_endpoint_id = hop.dst.rse.attributes.get('globus_endpoint_id', None)
-                if not source_globus_endpoint_id or not dest_globus_endpoint_id:
-                    all_rses_have_globus_id = False
-                    break
+    if dest_is_deterministic:
+        dest_url = list(protocol.lfns2pfns(lfns={'scope': scope.external, 'name': name}).values())[0]
+    else:
+        # compute dest url in case of non deterministic
+        # naming convention, etc.
+        dsn = get_dsn(scope, name, dict_attributes.get('dsn', None))
+        # DQ2 path always starts with /, but prefix might not end with /
+        naming_convention = dest_rse_attrs.get('naming_convention', None)
+        dest_path = construct_surl(dsn, name, naming_convention)
+        if dest_is_tape:
+            if retry_count or activity == 'Recovery':
+                dest_path = '%s_%i' % (dest_path, int(time.time()))
 
-            if not all_rses_have_globus_id:
-                logger(logging.ERROR, 'Globus endpoint attribute not defined - for at least one transfer hops {} {}'.format(','.join(transfer_path), rws.request_id))
-                continue
-        else:
-            common_fts_hosts = []
-            for hop in transfer_path:
-                fts_hosts = hop.dst.rse.attributes.get('fts', None)
-                if hop.src.rse.attributes.get('sign_url', None) == 'gcs':
-                    fts_hosts = hop.src.rse.attributes.get('fts', None)
-                fts_hosts = fts_hosts.split(",") if fts_hosts else []
+        dest_url = list(protocol.lfns2pfns(lfns={'scope': scope.external, 'name': name, 'path': dest_path}).values())[0]
 
-                common_fts_hosts = fts_hosts if not common_fts_hosts else list(set(common_fts_hosts).intersection(fts_hosts))
-                if not common_fts_hosts:
-                    break
+    return dest_url
 
-            if common_fts_hosts:
-                external_host = common_fts_hosts[0]
-                if retry_other_fts:
-                    external_host = common_fts_hosts[rws.retry_count % len(common_fts_hosts)]
-            else:
-                if transfertool == 'fts3':
-                    logger(logging.ERROR, 'FTS attribute not defined - for at least one transfer hops {} {}'.format(','.join(transfer_path), rws.request_id))
-                    continue
-                else:
-                    external_host = ''
 
-        for hop in transfer_path:
-            hop['external_host'] = external_host
+def __rewrite_source_url(source_url, source_sign_url, dest_sign_url, source_scheme):
+    """
+    Parametrize source url for some special cases of source and destination schemes
+    """
+    if dest_sign_url == 'gcs':
+        if source_scheme in ['davs', 'https']:
+            source_url += '?copy_mode=push'
+    elif dest_sign_url == 's3':
+        if source_scheme in ['davs', 'https']:
+            source_url += '?copy_mode=push'
+    elif WEBDAV_TRANSFER_MODE:
+        if source_scheme in ['davs', 'https']:
+            source_url += '?copy_mode=%s' % WEBDAV_TRANSFER_MODE
 
-        yield transfer_path
+    source_sign_url_map = {'gcs': 'gclouds', 's3': 's3s'}
+    if source_sign_url in source_sign_url_map:
+        if source_url[:7] == 'davs://':
+            source_url = source_sign_url_map[source_sign_url] + source_url[4:]
+        if source_url[:8] == 'https://':
+            source_url = source_sign_url_map[source_sign_url] + source_url[5:]
+
+    if source_url[:12] == 'srm+https://':
+        source_url = 'srm' + source_url[9:]
+    return source_url
+
+
+def __rewrite_dest_url(dest_url, dest_sign_url, dest_scheme):
+    """
+    Parametrize destination url for some special cases of destination schemes
+    """
+    if dest_sign_url == 'gcs':
+        dest_url = re.sub('davs', 'gclouds', dest_url)
+        dest_url = re.sub('https', 'gclouds', dest_url)
+    elif dest_sign_url == 's3':
+        dest_url = re.sub('davs', 's3s', dest_url)
+        dest_url = re.sub('https', 's3s', dest_url)
+
+    if dest_url[:12] == 'srm+https://':
+        dest_url = 'srm' + dest_url[9:]
+    return dest_url
 
 
 @transactional_session
@@ -1290,66 +718,108 @@ def get_transfer_requests_and_source_replicas(total_workers=0, worker_number=0, 
     :param logger:                Optional decorated logger that can be passed from the calling daemons or servers.
     :param session:               The database session in use.
     :returns:                     transfers, reqs_no_source, reqs_scheme_mismatch, reqs_only_tape_source
-
-    Workflow:
-    - retrieve (from the database) the transfer requests with their possible source replicas
-    - for each source, compute the (possibly multihop) path between it and the transfer destination
-         build a multi-source transfer if possible: The scheme compatibility is important for multi-source transfers.
-         We iterate again over the single-hop sources and build a new transfer definition while enforcing the scheme compatibility
-         with the initial source.
-    - pick the best path among the ones computed previously
-    - if the chosen best path is a multihop, create intermediate replicas and the intermediate transfer requests
     """
 
-    request_with_sources = __list_transfer_requests_and_source_replicas(
-        total_workers=total_workers,
-        worker_number=worker_number,
-        limit=limit,
-        activity=activity,
-        older_than=older_than,
-        rses=rses,
-        request_state=RequestState.QUEUED,
-        transfertool=transfertool,
-        session=session,
-    )
+    req_sources = __list_transfer_requests_and_source_replicas(total_workers=total_workers,
+                                                               worker_number=worker_number,
+                                                               limit=limit,
+                                                               activity=activity,
+                                                               older_than=older_than,
+                                                               rses=rses,
+                                                               request_state=RequestState.QUEUED,
+                                                               transfertool=transfertool,
+                                                               session=session)
 
-    ctx = _RseLoaderContext(session)
+    class _LocalContext:
+        def __init__(self, session):
+            self.session = session
+            self.rse_id_to_name_map = {}
+            self.rse_id_to_info_map = {}
+            self.rse_id_to_attrs_map = {}
+            self.protocols = {}
+
+        def _ensure_rse_loaded(self, rse_id):
+            if rse_id not in self.rse_id_to_name_map:
+                rse_name = get_rse_name(rse_id=rse_id, session=self.session)
+                self.rse_id_to_name_map[rse_id] = rse_name
+                self.rse_id_to_info_map[rse_id] = rsemgr.get_rse_info(rse=rse_name,
+                                                                      vo=get_rse_vo(rse_id=rse_id, session=self.session),
+                                                                      session=self.session)
+                self.rse_id_to_attrs_map[rse_id] = get_rse_attributes(rse_id, session=self.session)
+
+        def rse_name(self, rse_id):
+            self._ensure_rse_loaded(rse_id)
+            return self.rse_id_to_name_map[rse_id]
+
+        def rse_info(self, rse_id):
+            self._ensure_rse_loaded(rse_id)
+            return self.rse_id_to_info_map[rse_id]
+
+        def rse_attrs(self, rse_id):
+            self._ensure_rse_loaded(rse_id)
+            return self.rse_id_to_attrs_map[rse_id]
+
+        def is_tape_rse(self, rse_id):
+            _rse_info = self.rse_info(rse_id)
+            if _rse_info['rse_type'] == RSEType.TAPE or _rse_info['rse_type'] == 'TAPE':
+                return True
+            return False
+
+        def protocol(self, rse_id, scheme, operation):
+            protocol_key = '%s_%s_%s' % (operation, rse_id, scheme)
+            protocol = self.protocols.get(protocol_key)
+            if not protocol:
+                protocol = rsemgr.create_protocol(self.rse_info(rse_id), 'third_party_copy', scheme)
+                self.protocols[protocol_key] = protocol
+            return protocol
+
+    ctx = _LocalContext(session)
     unavailable_read_rse_ids = __get_unavailable_rse_ids(operation='read', session=session)
     unavailable_write_rse_ids = __get_unavailable_rse_ids(operation='write', session=session)
 
-    transfers, reqs_no_source, reqs_only_tape_source, reqs_scheme_mismatch = {}, set(), set(), set()
-
-    include_multihop = False
-    if transfertool in ['fts3', None]:
-        include_multihop = core_config_get('transfers', 'use_multihop', default=False, expiration_time=600, session=session)
-
-    default_tombstone_delay = core_config_get('transfers', 'multihop_tombstone_delay', default=DEFAULT_MULTIHOP_TOMBSTONE_DELAY, expiration_time=600, session=session)
+    bring_online_local = bring_online
+    transfers, reqs_no_source, reqs_only_tape_source, reqs_scheme_mismatch = {}, [], [], []
+    multi_hop_dict = {}
 
     multihop_rses = []
-    if include_multihop:
-        try:
-            multihop_rses = [rse['id'] for rse in parse_expression('available_for_multihop=true')]
-        except InvalidRSEExpression:
-            pass
+    try:
+        multihop_rses = [rse['id'] for rse in parse_expression('available_for_multihop=true')]
+    except InvalidRSEExpression:
+        multihop_rses = []
 
-    for rws in request_with_sources:
+    for req_id, rule_id, scope, name, md5, adler32, bytes, activity, attributes, previous_attempt_id, dest_rse_id, account, source_rse_id, rse, deterministic, rse_type, path, retry_count, src_url, ranking, link_ranking in req_sources:
 
-        ctx.ensure_fully_loaded(rws.dest_rse)
-        for source in rws.sources:
-            ctx.ensure_fully_loaded(source.rse)
+        if ranking is None:
+            ranking = 0
 
-        logger(logging.DEBUG, 'Found following sources for %s: %s', rws, [str(src.rse) for src in rws.sources])
-        # Assume request doesn't have any sources. Will be removed later if sources are found.
-        reqs_no_source.add(rws.request_id)
+        multihop = False
 
-        # Check if destination is blocked
-        if rws.dest_rse.id in unavailable_write_rse_ids:
-            logger(logging.WARNING, 'RSE %s is blocked for write. Will skip the submission of new jobs', rws.dest_rse)
+        # Add req to req_no_source list (Will be removed later if needed)
+        if req_id not in reqs_no_source:
+            reqs_no_source.append(req_id)
+
+        # source_rse_id will be None if no source replicas
+        # rse will be None if rse is staging area
+        if source_rse_id is None or rse is None:
+            continue
+
+        if rses and dest_rse_id not in rses:
+            continue
+
+        dest_rse_name = ctx.rse_name(dest_rse_id)
+        source_rse_name = ctx.rse_name(source_rse_id)
+
+        dict_attributes = get_attributes(attributes)
+
+        # Check if the source and destination are blocked
+        if source_rse_id in unavailable_read_rse_ids:
+            continue
+        if dest_rse_id in unavailable_write_rse_ids:
+            logger(logging.WARNING, 'RSE %s is blocked for write. Will skip the submission of new jobs', dest_rse_name)
             continue
 
         # parse source expression
-        source_replica_expression = rws.attributes.get('source_replica_expression', None)
-        allowed_source_rses = None
+        source_replica_expression = dict_attributes.get('source_replica_expression', None)
         if source_replica_expression:
             try:
                 parsed_rses = parse_expression(source_replica_expression, session=session)
@@ -1357,181 +827,480 @@ def get_transfer_requests_and_source_replicas(total_workers=0, worker_number=0, 
                 logger(logging.ERROR, "Invalid RSE exception %s: %s", source_replica_expression, str(error))
                 continue
             else:
-                allowed_source_rses = [x['id'] for x in parsed_rses]
+                allowed_rses = [x['id'] for x in parsed_rses]
+                if source_rse_id not in allowed_rses:
+                    continue
 
-        filtered_sources = rws.sources
-        # Only keep allowed sources
-        if allowed_source_rses is not None:
-            filtered_sources = filter(lambda s: s.rse.id in allowed_source_rses, filtered_sources)
-        filtered_sources = filter(lambda s: s.rse.name is not None, filtered_sources)
-        # Ignore blocklisted RSEs
-        filtered_sources = filter(lambda s: s.rse.id not in unavailable_read_rse_ids, filtered_sources)
-        # Ignore tape sources if they are not desired
-        filtered_sources = list(filtered_sources)
-        had_tape_sources = len(filtered_sources) > 0
-        if not rws.attributes.get("allow_tape_source", True):
-            filtered_sources = filter(lambda s: not s.rse.is_tape_or_staging_required(), filtered_sources)
+        # Call the get_hops function to create a list of RSEs used for the transfer
+        # In case the source_rse and the dest_rse are connected, the list contains only the destination RSE
+        # In case of non-connected, the list contains all the intermediary RSEs
+        list_hops = []
+        include_multihop = False
+        if transfertool in ['fts3', None]:
+            include_multihop = core_config_get('transfers', 'use_multihop', default=False, expiration_time=600, session=session)
 
-        filtered_sources = list(filtered_sources)
-        if len(rws.sources) != len(filtered_sources):
-            logger(logging.DEBUG, 'Sources after filtering for %s: %s', rws, [str(src.rse) for src in filtered_sources])
-        any_source_had_scheme_mismatch = False
-        candidate_paths = []
-
-        paths = __create_transfer_definitions(ctx,
-                                              rws=rws,
-                                              sources=filtered_sources,
-                                              include_multihop=include_multihop,
-                                              multihop_rses=multihop_rses,
-                                              limit_dest_schemes=None,
-                                              session=session)
-        for source in filtered_sources:
-            transfer_path = paths.get(source.rse.id)
-            if transfer_path is None:
-                logger(logging.WARNING, "Request %s: no path from %s to %s", rws.request_id, source.rse, rws.dest_rse)
-                continue
-            if not transfer_path:
-                any_source_had_scheme_mismatch = True
-                logger(logging.WARNING, "Request %s: no matching protocol between %s and %s", rws.request_id, source.rse, rws.dest_rse)
-                continue
-
-            if len(transfer_path) > 1:
-                logger(logging.DEBUG, 'From %s to %s requires multihop: %s', source.rse, rws.dest_rse, [str(hop) for hop in transfer_path])
-            for hop in transfer_path:
-                hop.init_legacy_transfer_definition(bring_online=bring_online, logger=logger)
-
-            candidate_paths.append(transfer_path)
-
-        if len(filtered_sources) != len(candidate_paths):
-            logger(logging.DEBUG, 'Sources after path computation for %s: %s', rws, [str(path[0].src.rse) for path in candidate_paths])
-
-        best_path = None
-        candidate_paths = __filter_unwanted_paths(candidate_paths)
-        candidate_paths = __sort_paths(candidate_paths)
-        candidate_paths = __filter_for_transfertool_and_set_external_host(candidate_paths, rws=rws, transfertool=transfertool, retry_other_fts=retry_other_fts, logger=logger)
-        for transfer_path in candidate_paths:
-            if __create_missing_replicas_and_requests(transfer_path, default_tombstone_delay, logger=logger, session=session):
-                best_path = transfer_path
-                break
-
-        if not best_path:
-            # It can happen that some sources are skipped because they are TAPE, and others because
-            # of scheme mismatch. However, we can only have one state in the database. I picked to
-            # prioritize setting only_tape_source without any particular reason.
-            if had_tape_sources and not filtered_sources:
-                logger(logging.DEBUG, 'Only tape sources found for %s' % rws)
-                reqs_only_tape_source.add(rws.request_id)
-                reqs_no_source.remove(rws.request_id)
-            elif any_source_had_scheme_mismatch:
-                logger(logging.DEBUG, 'Scheme mismatch detected for %s' % rws)
-                reqs_scheme_mismatch.add(rws.request_id)
-                reqs_no_source.remove(rws.request_id)
-            else:
-                logger(logging.DEBUG, 'No candidate path found for %s' % rws)
+        try:
+            list_hops = get_hops(source_rse_id,
+                                 dest_rse_id,
+                                 include_multihop=include_multihop,
+                                 multihop_rses=multihop_rses,
+                                 limit_dest_schemes=transfers.get(req_id, {}).get('schemes', None),
+                                 session=session)
+            if len(list_hops) > 1:
+                logger(logging.DEBUG, 'From %s to %s requires multihop: %s', source_rse_id, dest_rse_id, list_hops)
+                multihop = True
+                multi_hop_dict[req_id] = (list_hops, dict_attributes, retry_count)
+        except NoDistance:
+            logger(logging.WARNING, "Request %s: no link from %s to %s", req_id, source_rse_name, dest_rse_name)
+            if req_id in reqs_scheme_mismatch:
+                reqs_scheme_mismatch.remove(req_id)
+            if req_id not in reqs_no_source:
+                reqs_no_source.append(req_id)
+            continue
+        except RSEProtocolNotSupported:
+            logger(logging.WARNING, "Request %s: no matching protocol between %s and %s", req_id, source_rse_name, dest_rse_name)
+            if req_id in reqs_no_source:
+                reqs_no_source.remove(req_id)
+            if req_id not in reqs_scheme_mismatch:
+                reqs_scheme_mismatch.append(req_id)
             continue
 
-        for i, hop in enumerate(best_path):
-            hop['file_metadata']['request_id'] = hop.rws.request_id
-            hop['request_id'] = hop.rws.request_id
-            if len(best_path) > 1:
-                hop['multihop'] = True
-                hop['initial_request_id'] = rws.request_id
-                hop['parent_request'] = best_path[i - 1].rws.request_id if i > 0 else None
+        source_scheme = list_hops[0]['source_scheme']
+        dest_scheme = list_hops[-1]['dest_scheme']
+        dest_scheme_priority = list_hops[-1]['dest_scheme_priority']
 
-        if len(best_path) > 1:
-            logger(logging.DEBUG, 'Best path is multihop for %s: %s' % (rws, [str(hop) for hop in best_path]))
+        allow_tape_source = True
+        try:
+            # Get source protocol
+            source_protocol = ctx.protocol(source_rse_id, source_scheme, 'read')
+
+            source_sign_url = ctx.rse_attrs(source_rse_id).get('sign_url', None)
+            dest_sign_url = ctx.rse_attrs(dest_rse_id).get('sign_url', None)
+
+            # Compute the source URL
+            source_url = list(source_protocol.lfns2pfns(lfns={'scope': scope.external, 'name': name, 'path': path}).values())[0]
+            source_url = __rewrite_source_url(source_url, source_sign_url=source_sign_url, dest_sign_url=dest_sign_url, source_scheme=source_scheme)
+
+            # If the request_id is not already in the transfer dictionary, need to compute the destination URL
+            if req_id not in transfers:
+
+                # parse allow tape source expression, not finally version.
+                # allow_tape_source = attr["allow_tape_source"] if (attr and "allow_tape_source" in attr) else True
+                allow_tape_source = True
+
+                # Extend the metadata dictionary with request attributes
+                transfer_src_type = "DISK"
+                transfer_dst_type = "DISK"
+                overwrite, bring_online = True, None
+                if ctx.is_tape_rse(source_rse_id) or ctx.rse_attrs(source_rse_id).get('staging_required', False):
+                    bring_online = bring_online_local
+                    transfer_src_type = "TAPE"
+                    if not allow_tape_source:
+                        if req_id not in reqs_only_tape_source:
+                            reqs_only_tape_source.append(req_id)
+                        if req_id in reqs_no_source:
+                            reqs_no_source.remove(req_id)
+                        continue
+
+                if ctx.is_tape_rse(dest_rse_id):
+                    overwrite = False
+                    transfer_dst_type = "TAPE"
+
+                # Get destination protocol
+                dest_protocol = ctx.protocol(dest_rse_id, dest_scheme, 'write')
+
+                # Compute the destination url
+                dest_url = __build_dest_url(scope=scope, name=name,
+                                            protocol=dest_protocol,
+                                            dest_rse_attrs=ctx.rse_attrs(dest_rse_id),
+                                            dest_is_deterministic=ctx.rse_info(dest_rse_id)['deterministic'],
+                                            dest_is_tape=ctx.is_tape_rse(dest_rse_id),
+                                            dict_attributes=dict_attributes,
+                                            retry_count=retry_count,
+                                            activity=activity)
+                dest_url = __rewrite_dest_url(dest_url, dest_sign_url=dest_sign_url, dest_scheme=dest_scheme)
+
+                # Get dest space token
+                dest_spacetoken = None
+                if dest_protocol.attributes and 'extended_attributes' in dest_protocol.attributes and \
+                        dest_protocol.attributes['extended_attributes'] and 'space_token' in dest_protocol.attributes['extended_attributes']:
+                    dest_spacetoken = dest_protocol.attributes['extended_attributes']['space_token']
+
+                use_ipv4 = ctx.rse_attrs(source_rse_id).get('use_ipv4', False) or ctx.rse_attrs(dest_rse_id).get('use_ipv4', False)
+
+                # get external_host + strict_copy + archive timeout
+                strict_copy = ctx.rse_attrs(dest_rse_id).get('strict_copy', False)
+                fts_hosts = ctx.rse_attrs(dest_rse_id).get('fts', None)
+                archive_timeout = ctx.rse_attrs(dest_rse_id).get('archive_timeout', None)
+                if source_sign_url == 'gcs':
+                    fts_hosts = ctx.rse_attrs(source_rse_id).get('fts', None)
+                source_globus_endpoint_id = ctx.rse_attrs(source_rse_id).get('globus_endpoint_id', None)
+                dest_globus_endpoint_id = ctx.rse_attrs(dest_rse_id).get('globus_endpoint_id', None)
+
+                if transfertool == 'fts3' and not fts_hosts:
+                    logger(logging.ERROR, 'Destination RSE %s FTS attribute not defined - SKIP REQUEST %s', dest_rse_name, req_id)
+                    continue
+                if transfertool == 'globus' and (not dest_globus_endpoint_id or not source_globus_endpoint_id):
+                    logger(logging.ERROR, 'Destination RSE %s Globus endpoint attributes not defined - SKIP REQUEST %s', dest_rse_name, req_id)
+                    continue
+                if retry_count is None:
+                    retry_count = 0
+                external_host = ''
+                if fts_hosts:
+                    fts_list = fts_hosts.split(",")
+                    external_host = fts_list[0]
+
+                if retry_other_fts:
+                    external_host = fts_list[retry_count % len(fts_list)]
+
+                # Get the checksum validation strategy (none, source, destination or both)
+                verify_checksum = 'both'
+                if not ctx.rse_attrs(dest_rse_id).get('verify_checksum', True):
+                    if not ctx.rse_attrs(source_rse_id).get('verify_checksum', True):
+                        verify_checksum = 'none'
+                    else:
+                        verify_checksum = 'source'
+                else:
+                    if not ctx.rse_attrs(source_rse_id).get('verify_checksum', True):
+                        verify_checksum = 'destination'
+                    else:
+                        verify_checksum = 'both'
+
+                source_rse_checksums = get_rse_supported_checksums(source_rse_id, session=session)
+                dest_rse_checksums = get_rse_supported_checksums(dest_rse_id, session=session)
+
+                common_checksum_names = set(source_rse_checksums).intersection(dest_rse_checksums)
+
+                if len(common_checksum_names) == 0:
+                    logger(logging.INFO, 'No common checksum method. Verifying destination only.')
+                    verify_checksum = 'destination'
+
+                # Fill the transfer dictionary including file_metadata
+                file_metadata = {'request_id': req_id,
+                                 'scope': scope,
+                                 'name': name,
+                                 'activity': activity,
+                                 'request_type': RequestType.TRANSFER,
+                                 'src_type': transfer_src_type,
+                                 'dst_type': transfer_dst_type,
+                                 'src_rse': source_rse_name,
+                                 'dst_rse': dest_rse_name,
+                                 'src_rse_id': source_rse_id,
+                                 'dest_rse_id': dest_rse_id,
+                                 'filesize': bytes,
+                                 'md5': md5,
+                                 'adler32': adler32,
+                                 'verify_checksum': verify_checksum,
+                                 'source_globus_endpoint_id': source_globus_endpoint_id,
+                                 'dest_globus_endpoint_id': dest_globus_endpoint_id}
+
+                if previous_attempt_id:
+                    file_metadata['previous_attempt_id'] = previous_attempt_id
+
+                transfers[req_id] = {'request_id': req_id,
+                                     'schemes': __add_compatible_schemes(schemes=[dest_scheme], allowed_schemes=SUPPORTED_PROTOCOLS),
+                                     'account': account,
+                                     # 'src_urls': [source_url],
+                                     'sources': [(rse, source_url, source_rse_id, ranking, link_ranking)],
+                                     'dest_urls': [dest_url],
+                                     'src_spacetoken': None,
+                                     'dest_spacetoken': dest_spacetoken,
+                                     'overwrite': overwrite,
+                                     'bring_online': bring_online,
+                                     'copy_pin_lifetime': dict_attributes.get('lifetime', 172800),
+                                     'external_host': external_host,
+                                     'selection_strategy': 'auto',
+                                     'rule_id': rule_id,
+                                     'file_metadata': file_metadata,
+                                     'dest_scheme_priority': dest_scheme_priority}
+                if multihop:
+                    transfers[req_id]['multihop'] = True
+                    transfers[req_id]['initial_request_id'] = req_id
+                if strict_copy:
+                    transfers[req_id]['strict_copy'] = strict_copy
+                if use_ipv4:
+                    transfers[req_id]['use_ipv4'] = True
+                if archive_timeout and ctx.is_tape_rse(dest_rse_id):
+                    try:
+                        transfers[req_id]['archive_timeout'] = int(archive_timeout)
+                        logger(logging.DEBUG, 'Added archive timeout to transfer.')
+                    except ValueError:
+                        logger(logging.WARNING, 'Could not set archive_timeout for %s. Must be integer.', dest_url)
+                        pass
+            else:
+                # parse allow tape source expression, not finally version.
+                allow_tape_source = dict_attributes.get('allow_tape_source', None)
+
+                # No check yet if the previous one is a multihop or not.
+                # TODO : Check if the current  transfer is better than the previous one
+                if multihop:
+                    continue
+
+                current_source_is_tape = transfers[req_id]['bring_online']
+                new_source_is_tape = ctx.is_tape_rse(source_rse_id) or ctx.rse_attrs(source_rse_id).get('staging_required', False)
+
+                if new_source_is_tape and not allow_tape_source:
+                    continue
+
+                if current_source_is_tape and not new_source_is_tape or \
+                        new_source_is_tape and not current_source_is_tape:
+                    # Tape and Disk sources must not be used at the same time.
+                    # Either keep existing sources unchanged, or substitute all existing source with the new source.
+
+                    # Find the best ranking among existing sources
+                    avail_top_ranking = None
+                    for founded_source in transfers[req_id]['sources']:
+                        if avail_top_ranking is None:
+                            avail_top_ranking = founded_source[3]
+                            continue
+                        if founded_source[3] is not None and founded_source[3] > avail_top_ranking:
+                            avail_top_ranking = founded_source[3]
+
+                    # If ranking of the new source is better. On equal ranking, prefer Disk over Tape.
+                    if avail_top_ranking is None or (ranking > avail_top_ranking) or (ranking >= avail_top_ranking and current_source_is_tape):
+                        transfers[req_id]['sources'] = []
+                        transfers[req_id]['bring_online'] = bring_online_local if new_source_is_tape else None
+                        transfers[req_id]['file_metadata']['src_type'] = 'TAPE' if new_source_is_tape else 'DISK'
+                        transfers[req_id]['file_metadata']['src_rse'] = rse
+                    else:
+                        continue
+
+                if current_source_is_tape and new_source_is_tape:
+                    # multiple Tape source replicas are not allowed in FTS3.
+                    # Either keep the old source. Or substitute it with the new one.
+                    prev_is_multihop = transfers[req_id]['sources'][0][4] is None  # will be None if the previous transfer is multihop
+                    if ranking > transfers[req_id]['sources'][0][3]\
+                            or (ranking == transfers[req_id]['sources'][0][3] and (prev_is_multihop
+                                                                                   or link_ranking < transfers[req_id]['sources'][0][4])):
+                        transfers[req_id]['sources'] = []
+                        transfers[req_id]['bring_online'] = bring_online_local
+                        transfers[req_id]['file_metadata']['src_rse'] = rse
+                    else:
+                        continue
+
+                # The transfer queued previously is a multihop, but this one is direct.
+                # Reset the sources, remove the multihop flag
+                if transfers[req_id].get('multihop', False):
+                    transfers[req_id].pop('multihop', None)
+                    transfers[req_id]['sources'] = []
+
+                transfers[req_id]['sources'].append((rse, source_url, source_rse_id, ranking, link_ranking))
+                # if one source has force IPv4, force IPv4 for the whole job
+                use_ipv4 = ctx.rse_attrs(source_rse_id).get('use_ipv4', False)
+                if use_ipv4:
+                    transfers[req_id]['use_ipv4'] = True
+
+        except Exception:
+            logger(logging.CRITICAL, "Exception happened when trying to get transfer for request %s:" % (req_id), exc_info=True)
+            break
+
+    # checking OIDC AuthN/Z support per destination and soucre RSEs;
+    # assumes use of boolean 'oidc_support' RSE attribute
+    for req_id in transfers:
+        use_oidc = False
+        dest_rse_id = transfers[req_id]['file_metadata']['dest_rse_id']
+        if 'oidc_support' in ctx.rse_attrs(dest_rse_id):
+            use_oidc = ctx.rse_attrs(dest_rse_id)['oidc_support']
         else:
-            logger(logging.DEBUG, 'Best path is direct for %s: %s' % (rws, best_path[0]))
+            transfers[req_id]['use_oidc'] = use_oidc
+            continue
+        for source in transfers[req_id]['sources']:
+            source_rse_id = source[2]
+            if 'oidc_support' in ctx.rse_attrs(source_rse_id):
+                use_oidc = use_oidc and ctx.rse_attrs(source_rse_id)['oidc_support']
+            else:
+                use_oidc = False
+            if not use_oidc:
+                break
+        # OIDC token will be requested for the account of this tranfer
+        transfers[req_id]['use_oidc'] = use_oidc
 
-        transfers[rws.request_id] = best_path
-        reqs_no_source.remove(rws.request_id)
+    for req_id in copy.deepcopy(transfers):
+        # If the transfer is a multihop, need to create the intermediate replicas, intermediate requests and the transfers
+        if transfers[req_id].get('multihop', False):
+            parent_request = None
+            scope = transfers[req_id]['file_metadata']['scope']
+            name = transfers[req_id]['file_metadata']['name']
+            list_multihop, dict_attributes, retry_count = multi_hop_dict[req_id]
+            parent_requests = []
+
+            for hop in list_multihop:
+                # hop = {'source_rse_id': source_rse_id, 'source_scheme': 'srm', 'source_scheme_priority': N, 'dest_rse_id': dest_rse_id, 'dest_scheme': 'srm', 'dest_scheme_priority': N}
+                source_scheme = hop['source_scheme']
+                source_rse_id = hop['source_rse_id']
+                dest_rse_id = hop['dest_rse_id']
+                source_rse_name = ctx.rse_name(source_rse_id)
+                dest_rse_name = ctx.rse_name(dest_rse_id)
+                dest_rse_vo = get_rse_vo(rse_id=hop['dest_rse_id'], session=session)
+                transfer_src_type = "DISK"
+                transfer_dst_type = "DISK"
+                allow_tape_source = True
+                # Compute the source URL. We don't need to fill the rse_mapping and rse_attrs for the intermediate RSEs cause it has already been done before
+                source_protocol = ctx.protocol(source_rse_id, source_scheme, 'read')
+                source_url = list(source_protocol.lfns2pfns(lfns={'scope': scope.external, 'name': name, 'path': None}).values())[0]
+
+                if transfers[req_id]['file_metadata']['dest_rse_id'] != hop['dest_rse_id']:
+                    files = [{'scope': scope,
+                              'name': name,
+                              'bytes': transfers[req_id]['file_metadata']['filesize'],
+                              'adler32': transfers[req_id]['file_metadata']['adler32'],
+                              'md5': transfers[req_id]['file_metadata']['md5'],
+                              'state': 'C'}]
+                    try:
+                        add_replicas(rse_id=hop['dest_rse_id'],
+                                     files=files,
+                                     account=InternalAccount('root', vo=dest_rse_vo),
+                                     ignore_availability=False,
+                                     dataset_meta=None,
+                                     session=session)
+                    except Exception as error:
+                        logger(logging.ERROR, 'Problem adding replicas %s:%s on %s : %s', scope, name, dest_rse_name, str(error))
+
+                    req_attributes = {'activity': transfers[req_id]['file_metadata']['activity'],
+                                      'source_replica_expression': None,
+                                      'lifetime': None,
+                                      'ds_scope': None,
+                                      'ds_name': None,
+                                      'bytes': transfers[req_id]['file_metadata']['filesize'],
+                                      'md5': transfers[req_id]['file_metadata']['md5'],
+                                      'adler32': transfers[req_id]['file_metadata']['adler32'],
+                                      'priority': None,
+                                      'allow_tape_source': True}
+                    new_req = queue_requests(requests=[{'dest_rse_id': dest_rse_id,
+                                                        'scope': scope,
+                                                        'name': name,
+                                                        'rule_id': '00000000000000000000000000000000',  # Dummy Rule ID used for multihop. TODO: Replace with actual rule_id once we can flag intermediate requests
+                                                        'attributes': req_attributes,
+                                                        'request_type': RequestType.TRANSFER,
+                                                        'retry_count': retry_count,
+                                                        'account': InternalAccount('root', vo=dest_rse_vo),
+                                                        'requested_at': datetime.datetime.now()}], session=session)
+                    # If a request already exists, new_req will be an empty list.
+                    if not new_req:
+                        # Need to fail all the intermediate requests + the initial one and exit the multihop loop
+                        logger(logging.WARNING, 'Multihop : A request already exists for the transfer between %s and %s. Will cancel all the parent requests', source_rse_name, dest_rse_name)
+                        parent_requests.append(req_id)
+                        try:
+                            set_requests_state(request_ids=parent_requests, new_state=RequestState.FAILED, session=session)
+                        except UnsupportedOperation:
+                            logger(logging.ERROR, 'Multihop : Cannot cancel all the parent requests : %s', str(parent_requests))
+
+                        # Remove from the transfer dictionary all the requests
+                        for cur_req_id in parent_requests:
+                            transfers.pop(cur_req_id, None)
+                        break
+                    new_req_id = new_req[0]['id']
+                    parent_requests.append(new_req_id)
+                    set_requests_state(request_ids=[new_req_id, ], new_state=RequestState.QUEUED, session=session)
+                    logger(logging.DEBUG, 'New request created for the transfer between %s and %s : %s', source_rse_name, dest_rse_name, new_req_id)
+
+                    # Here we will compute the destination URL
+                    # Get destination protocol
+                    dest_rse_id = hop['dest_rse_id']
+                    dest_scheme = hop['dest_scheme']
+                    dest_protocol = ctx.protocol(dest_rse_id, dest_scheme, 'write')
+
+                    # Get dest space token
+                    dest_spacetoken = None
+                    if dest_protocol.attributes and 'extended_attributes' in dest_protocol.attributes and \
+                            dest_protocol.attributes['extended_attributes'] and 'space_token' in dest_protocol.attributes['extended_attributes']:
+                        dest_spacetoken = dest_protocol.attributes['extended_attributes']['space_token']
+
+                    # Compute the destination url
+                    dest_url = __build_dest_url(scope=scope, name=name,
+                                                protocol=dest_protocol,
+                                                dest_rse_attrs=ctx.rse_attrs(dest_rse_id),
+                                                dest_is_deterministic=ctx.rse_info(dest_rse_id)['deterministic'],
+                                                dest_is_tape=ctx.is_tape_rse(dest_rse_id),
+                                                dict_attributes=dict_attributes,
+                                                retry_count=retry_count,
+                                                activity=activity)
+
+                    # Extend the metadata dictionary with request attributes
+                    overwrite, bring_online = True, None
+                    if ctx.is_tape_rse(source_rse_id):
+                        bring_online = bring_online_local
+                        transfer_src_type = "TAPE"
+                        if not allow_tape_source:
+                            if req_id not in reqs_only_tape_source:
+                                reqs_only_tape_source.append(req_id)
+                            if req_id in reqs_no_source:
+                                reqs_no_source.remove(req_id)
+                            continue
+                    if ctx.is_tape_rse(dest_rse_id):
+                        overwrite = False
+                        transfer_dst_type = "TAPE"
+
+                    file_metadata = {'request_id': new_req_id,
+                                     'scope': scope,
+                                     'name': name,
+                                     'activity': transfers[req_id]['file_metadata']['activity'],
+                                     'request_type': RequestType.TRANSFER,
+                                     'src_type': transfer_src_type,
+                                     'dst_type': transfer_dst_type,
+                                     'src_rse': source_rse_name,
+                                     'dst_rse': dest_rse_name,
+                                     'src_rse_id': source_rse_id,
+                                     'dest_rse_id': dest_rse_id,
+                                     'filesize': transfers[req_id]['file_metadata']['filesize'],
+                                     'md5': transfers[req_id]['file_metadata']['md5'],
+                                     'adler32': transfers[req_id]['file_metadata']['adler32'],
+                                     'verify_checksum': transfers[req_id]['file_metadata']['verify_checksum'],
+                                     'source_globus_endpoint_id': transfers[req_id]['file_metadata']['source_globus_endpoint_id'],
+                                     'dest_globus_endpoint_id': transfers[req_id]['file_metadata']['dest_globus_endpoint_id']}
+                    transfers[new_req_id] = {'request_id': new_req_id,
+                                             'initial_request_id': req_id,
+                                             'parent_request': parent_request,
+                                             'account': InternalAccount('root'),
+                                             'schemes': __add_compatible_schemes(schemes=[dest_scheme], allowed_schemes=SUPPORTED_PROTOCOLS),
+                                             # 'src_urls': [source_url],
+                                             'sources': [(source_rse_name, source_url, source_rse_id, 0, 0)],
+                                             'dest_urls': [dest_url],
+                                             'src_spacetoken': None,
+                                             'dest_spacetoken': dest_spacetoken,
+                                             'overwrite': transfers[req_id]['overwrite'],
+                                             'bring_online': bring_online,
+                                             'copy_pin_lifetime': transfers[req_id]['copy_pin_lifetime'],
+                                             'external_host': transfers[req_id]['external_host'],
+                                             'selection_strategy': 'auto',
+                                             'rule_id': transfers[req_id]['rule_id'],
+                                             'multihop': True,
+                                             'file_metadata': file_metadata}
+                    parent_request = new_req_id
+
+                else:
+                    # For the last hop, we just need to correct the source
+                    transfers[req_id]['parent_request'] = parent_request
+                    transfers[req_id]['file_metadata']['src_rse_id'] = source_rse_id
+                    transfers[req_id]['file_metadata']['src_rse'] = source_rse_name
+                    # We make the assumption that the hop is never made through TAPE
+                    transfers[req_id]['file_metadata']['src_type'] = 'DISK'
+                    transfers[req_id]['sources'] = [(source_rse_name, source_url, source_rse_id, 0, 0)]
+                    transfers[req_id]['bring_online'] = bring_online
+        if req_id in reqs_no_source:
+            reqs_no_source.remove(req_id)
+        if req_id in reqs_only_tape_source:
+            reqs_only_tape_source.remove(req_id)
+        if req_id in reqs_scheme_mismatch:
+            reqs_scheme_mismatch.remove(req_id)
 
     return transfers, reqs_no_source, reqs_scheme_mismatch, reqs_only_tape_source
 
 
-@transactional_session
-def __create_missing_replicas_and_requests(transfer_path, default_tombstone_delay, logger, session=None):
-    # Create replicas and requests in the database for the intermediate hops
-    creation_successful = True
-    created_requests = []
-    for hop in transfer_path:
-        rws = hop.rws
-        if rws.request_id:
-            continue
-
-        if 'multihop_tombstone_delay' in rws.dest_rse.attributes:
-            tombstone = tombstone_from_delay(rws.dest_rse.attributes['multihop_tombstone_delay'])
-        else:
-            tombstone = tombstone_from_delay(default_tombstone_delay)
-        files = [{'scope': rws.scope,
-                  'name': rws.name,
-                  'bytes': rws.byte_count,
-                  'adler32': rws.adler32,
-                  'md5': rws.md5,
-                  'tombstone': tombstone,
-                  'state': 'C'}]
-        try:
-            add_replicas(rse_id=rws.dest_rse.id,
-                         files=files,
-                         account=rws.account,
-                         ignore_availability=False,
-                         dataset_meta=None,
-                         session=session)
-        except Exception as error:
-            logger(logging.ERROR, 'Problem adding replicas %s:%s on %s : %s', rws.scope, rws.name, rws.dest_rse, str(error))
-
-        new_req = queue_requests(requests=[{'dest_rse_id': rws.dest_rse.id,
-                                            'scope': rws.scope,
-                                            'name': rws.name,
-                                            'rule_id': '00000000000000000000000000000000',  # Dummy Rule ID used for multihop. TODO: Replace with actual rule_id once we can flag intermediate requests
-                                            'attributes': rws.attributes,
-                                            'request_type': RequestType.TRANSFER,
-                                            'retry_count': rws.retry_count,
-                                            'account': rws.account,
-                                            'requested_at': datetime.datetime.now()}], session=session)
-        # If a request already exists, new_req will be an empty list.
-        if not new_req:
-            creation_successful = False
-            break
-        rws.request_id = new_req[0]['id']
-        logger(logging.DEBUG, 'New request created for the transfer between %s and %s : %s', transfer_path[0].src, transfer_path[-1].dst, rws)
-        set_requests_state(request_ids=[rws.request_id, ], new_state=RequestState.QUEUED, session=session)
-        created_requests.append(rws.request_id)
-
-    if not creation_successful:
-        # Need to fail all the intermediate requests
-        logger(logging.WARNING, 'Multihop : A request already exists for the transfer between %s and %s. Will cancel all the parent requests', transfer_path[0].src, transfer_path[-1].dst)
-        try:
-            set_requests_state(request_ids=created_requests, new_state=RequestState.FAILED, session=session)
-        except UnsupportedOperation:
-            logger(logging.ERROR, 'Multihop : Cannot cancel all the parent requests : %s', str(created_requests))
-
-    return creation_successful
-
-
 @read_session
-def __list_transfer_requests_and_source_replicas(
-    total_workers=0,
-    worker_number=0,
-    limit=None,
-    activity=None,
-    older_than=None,
-    rses=None,
-    request_state=None,
-    transfertool=None,
-    session=None,
-) -> "List[RequestWithSources]":
+def __list_transfer_requests_and_source_replicas(total_workers=0, worker_number=0, limit=None, activity=None,
+                                                 older_than=None, rses=None, request_state=None, transfertool=None, session=None) -> "List[Tuple]":
     """
     List requests with source replicas
-    :param total_workers:    Number of total workers.
-    :param worker_number:    Id of the executing worker.
+    :param total_workers:     Number of total workers.
+    :param worker_number:     Id of the executing worker.
     :param limit:            Integer of requests to retrieve.
     :param activity:         Activity to be selected.
     :param older_than:       Only select requests older than this DateTime.
     :param rses:             List of rse_id to select requests.
     :param transfertool:     The transfer tool as specified in rucio.cfg.
     :param session:          Database session to use.
-    :returns:                List of RequestWithSources objects.
+    :returns:                List.
     """
 
     if request_state is None:
@@ -1558,6 +1327,8 @@ def __list_transfer_requests_and_source_replicas(
         .filter(models.RSE.deleted == false()) \
         .order_by(models.Request.created_at) \
         .filter(models.RSE.availability.in_((2, 3, 6, 7)))
+    print("sub_requests")
+    print(sub_requests)
 
     if isinstance(older_than, datetime.datetime):
         sub_requests = sub_requests.filter(models.Request.requested_at < older_than)
@@ -1591,10 +1362,13 @@ def __list_transfer_requests_and_source_replicas(
                           sub_requests.c.previous_attempt_id,
                           sub_requests.c.dest_rse_id,
                           sub_requests.c.account,
-                          sub_requests.c.retry_count,
-                          models.RSE.id,
+                          models.RSEFileAssociation.rse_id,
                           models.RSE.rse,
+                          models.RSE.deterministic,
+                          models.RSE.rse_type,
                           models.RSEFileAssociation.path,
+                          sub_requests.c.retry_count,
+                          models.Source.url,
                           models.Source.ranking.label("source_ranking"),
                           models.Distance.ranking.label("distance_ranking")) \
         .order_by(sub_requests.c.created_at) \
@@ -1611,7 +1385,9 @@ def __list_transfer_requests_and_source_replicas(
         .outerjoin(models.Distance, and_(sub_requests.c.dest_rse_id == models.Distance.dest_rse_id,
                                          models.RSEFileAssociation.rse_id == models.Distance.src_rse_id)) \
         .with_hint(models.Distance, "+ index(distances DISTANCES_PK)", 'oracle')
-
+    print("Querys")
+    for q in query:
+        print(q)
     # if transfertool specified, select only the requests where the source rses are set up for the transfer tool
     if transfertool:
         query = query.subquery()
@@ -1620,25 +1396,14 @@ def __list_transfer_requests_and_source_replicas(
             .filter(models.RSEAttrAssociation.key == 'transfertool',
                     models.RSEAttrAssociation.value.like('%' + transfertool + '%'))
 
-    requests_by_id = {}
-    for (request_id, rule_id, scope, name, md5, adler32, byte_count, activity, attributes, previous_attempt_id, dest_rse_id, account, retry_count,
-         source_rse_id, source_rse_name, file_path, source_ranking, distance_ranking) in query:
-
-        # rses (of unknown length) should be a temporary table to check against instead of this special case
-        if rses and dest_rse_id not in rses:
-            continue
-
-        request = requests_by_id.get(request_id)
-        if not request:
-            request = RequestWithSources(id_=request_id, rule_id=rule_id, scope=scope, name=name, md5=md5, adler32=adler32, byte_count=byte_count,
-                                         activity=activity, attributes=attributes, previous_attempt_id=previous_attempt_id,
-                                         dest_rse_data=RseData(id_=dest_rse_id), account=account, retry_count=retry_count)
-            requests_by_id[request_id] = request
-
-        if source_rse_id is not None:
-            request.sources.append(TransferSource(rse_data=RseData(id_=source_rse_id, name=source_rse_name), file_path=file_path,
-                                                  source_ranking=source_ranking, distance_ranking=distance_ranking))
-    return list(requests_by_id.values())
+    if rses:
+        result = []
+        for item in query.all():
+            dest_rse_id = item[10]
+            if dest_rse_id in rses:
+                result.append(item)
+        return result
+    return query.all()
 
 
 @transactional_session
@@ -1670,7 +1435,7 @@ def __get_unavailable_rse_ids(operation, session=None, logger=logging.log):
     """
 
     if operation not in ['read', 'write', 'delete']:
-        logger(logging.ERROR, "Wrong operation specified : %s" % operation)
+        logger(logging.ERROR, "Wrong operation specified : %s" % (operation))
         return []
     key = 'unavailable_%s_rse_ids' % operation
     result = REGION_SHORT.get(key)
@@ -1683,7 +1448,7 @@ def __get_unavailable_rse_ids(operation, session=None, logger=logging.log):
             REGION_SHORT.set(key, unavailable_rse_ids)
             return unavailable_rse_ids
         except Exception:
-            logger(logging.ERROR, "Failed to refresh unavailable %s rses, error" % operation, exc_info=True)
+            logger(logging.ERROR, "Failed to refresh unavailable %s rses, error" % (operation), exc_info=True)
             return []
     return result
 
@@ -1772,3 +1537,17 @@ def __load_rse_settings(rse_id, session=None):
                                      session=session)
         REGION_SHORT.set('rse_settings_%s' % str(rse_id), result)
     return result
+
+
+def __return_fts_states_for_transfer_id(transfer_id, fts_resps):
+    if transfer_id not in fts_resps:
+        fts_resps[transfer_id] = Exception("Transfer id %s is not returned" % transfer_id)
+        if fts_resps[transfer_id] and not isinstance(fts_resps[transfer_id], Exception):
+            for request_id in fts_resps[transfer_id]:
+                if fts_resps[transfer_id][request_id]['file_state'] in (str(FTSState.FAILED.name),
+                                                                        str(FTSState.FINISHEDDIRTY.name),
+                                                                        str(FTSState.CANCELED.name)):
+                    fts_resps[transfer_id][request_id]['new_state'] = RequestState.FAILED
+                elif fts_resps[transfer_id][request_id]['file_state'] in str(FTSState.FINISHED.name):
+                    fts_resps[transfer_id][request_id]['new_state'] = RequestState.DONE
+    return fts_resps

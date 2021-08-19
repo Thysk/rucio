@@ -192,10 +192,9 @@ def submitter(once=False, rses=None, partition_wait_time=10,
                 logger(logging.INFO, 'Starting to submit transfers for %s', activity)
                 if config_get_bool('common', 'multi_vo', False, None):
                     for vo in grouped_jobs:
-                        print(f"TIM: VO : {vo}")
-                        for external_host in grouped_jobs:
-                            for job in grouped_jobs[external_host]:
-                                logger(logging.DEBUG, 'submitjob: %s for vo: %s' % job, vo)
+                        for external_host in grouped_jobs[vo]:
+                            for job in grouped_jobs[vo][external_host]:
+                                logger(logging.DEBUG, 'submitjob: %s for vo: %s' % (job, vo))
                                 submit_transfer(external_host=external_host, job=job, submitter='transfer_submitter',
                                                 timeout=timeout, logger=logger, transfertool=transfertool, vo=vo)
                 else:

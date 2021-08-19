@@ -91,8 +91,9 @@ class FTS3Transfertool(Transfertool):
         :param external_host:   The external host where the transfertool API is running
         :param token: optional parameter to pass user's JWT
         """
-        if config_get_bool('common', 'multi_vo', False, None):
-            usercert = config_get('vo_certs', vo, False, None)
+        self.multi_vo = config_get_bool('common', 'multi_vo', False, None)
+        if self.multi_vo:
+            usercert = config_get('vo_certs', vo, False, config_get('conveyor', 'usercert', False, None))
         else:
             usercert = config_get('conveyor', 'usercert', False, None)
 
