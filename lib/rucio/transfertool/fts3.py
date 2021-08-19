@@ -84,16 +84,17 @@ class FTS3Transfertool(Transfertool):
     FTS3 implementation of a Rucio transfertool
     """
 
-    def __init__(self, external_host, token=None):
+    def __init__(self, external_host, token=None, vo=None):
         """
         Initializes the transfertool
 
         :param external_host:   The external host where the transfertool API is running
         :param token: optional parameter to pass user's JWT
         """
-
-        self.multi_vo = config_get_bool('common', 'multi_vo', False, None)
-        usercert = config_get('conveyor', 'usercert', False, None)
+        if config_get_bool('common', 'multi_vo', False, None):
+            usercert = config_get('vo_certs', vo, False, None)
+        else:
+            usercert = config_get('conveyor', 'usercert', False, None)
 
         # token for OAuth 2.0 OIDC authorization scheme (working only with dCache + davs/https protocols as of Sep 2019)
         self.token = token
@@ -151,8 +152,9 @@ class FTS3Transfertool(Transfertool):
             expected_transfer_id = self.__get_deterministic_id(job_params["sid"])
             logging.debug("Submit bulk transfers in deterministic mode, sid %s, expected transfer id: %s", job_params["sid"], expected_transfer_id)
 
-        # Multi_VO mode
+        """# Multi_VO mode
         if self.multi_vo:
+            # Variables used for sorting of the VO submissions
             vo_list = []
             vo_sorted_files = {}
 
@@ -166,6 +168,7 @@ class FTS3Transfertool(Transfertool):
             for vo in vo_list:
 
                 sorted_files = vo_sorted_files[vo]
+                print(f"TIM: sotred_files = {sorted_files}")
 
                 # bulk submission
                 params_dict = {'files': sorted_files, 'params': job_params}
@@ -173,23 +176,25 @@ class FTS3Transfertool(Transfertool):
 
                 post_result = None
 
-                vo_cert = config_get('vo_certs', vo, False, config_get('conveyor', 'usercert', False, None))
+                usercert = config_get('vo_certs', vo, False, config_get('conveyor', 'usercert', False, None))
 
-                self.cert = (vo_cert, vo_cert)
+                self.cert = (usercert, usercert)
 
                 transfer_id = self.__attempt_transfer(params_str, timeout, files, expected_transfer_id, post_result)
-                return transfer_id
+                print(f"TIM: transfer_id as it is generated = {transfer_id}")
+            print(f"TIM: transfer_id = {transfer_id}")
+            return transfer_id
 
         else:
-            # single VO mode
+            # single VO mode"""
 
-            # bulk submission
-            params_dict = {'files': files, 'params': job_params}
-            params_str = json.dumps(params_dict, cls=APIEncoder)
+        # bulk submission
+        params_dict = {'files': files, 'params': job_params}
+        params_str = json.dumps(params_dict, cls=APIEncoder)
 
-            post_result = None
-            transfer_id = self.__attempt_transfer(params_str, timeout, files, expected_transfer_id, post_result)
-            return transfer_id
+        post_result = None
+        transfer_id = self.__attempt_transfer(params_str, timeout, files, expected_transfer_id, post_result)
+        return transfer_id
 
     def cancel(self, transfer_ids, timeout=None):
         """

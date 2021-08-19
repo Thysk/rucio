@@ -190,11 +190,20 @@ def submitter(once=False, rses=None, partition_wait_time=10,
                 record_timer('daemons.conveyor.transfer_submitter.bulk_group_transfer', (time.time() - start_time) * 1000 / (len(transfers) if transfers else 1))
 
                 logger(logging.INFO, 'Starting to submit transfers for %s', activity)
-                for external_host in grouped_jobs:
-                    for job in grouped_jobs[external_host]:
-                        logger(logging.DEBUG, 'submitjob: %s' % job)
-                        submit_transfer(external_host=external_host, job=job, submitter='transfer_submitter',
-                                        timeout=timeout, logger=logger, transfertool=transfertool)
+                if config_get_bool('common', 'multi_vo', False, None):
+                    for vo in grouped_jobs:
+                        print(f"TIM: VO : {vo}")
+                        for external_host in grouped_jobs:
+                            for job in grouped_jobs[external_host]:
+                                logger(logging.DEBUG, 'submitjob: %s for vo: %s' % job, vo)
+                                submit_transfer(external_host=external_host, job=job, submitter='transfer_submitter',
+                                                timeout=timeout, logger=logger, transfertool=transfertool, vo=vo)
+                else:
+                    for external_host in grouped_jobs:
+                        for job in grouped_jobs[external_host]:
+                            logger(logging.DEBUG, 'submitjob: %s' % job)
+                            submit_transfer(external_host=external_host, job=job, submitter='transfer_submitter',
+                                            timeout=timeout, logger=logger, transfertool=transfertool, vo=None)
 
                 if len(transfers) < group_bulk:
                     logger(logging.INFO, 'Only %s transfers for %s which is less than group bulk %s, sleep %s seconds', len(transfers), activity, group_bulk, sleep_time)

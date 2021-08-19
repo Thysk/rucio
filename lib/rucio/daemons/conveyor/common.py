@@ -62,7 +62,7 @@ from rucio.rse import rsemanager as rsemgr
 TRANSFER_TOOL = config_get('conveyor', 'transfertool', False, None)
 
 
-def submit_transfer(external_host, job, submitter='submitter', timeout=None, logger=logging.log, transfertool=TRANSFER_TOOL):
+def submit_transfer(external_host, job, submitter='submitter', timeout=None, logger=logging.log, transfertool=TRANSFER_TOOL, vo=None):
     """
     Submit a transfer or staging request
 
@@ -124,9 +124,13 @@ def submit_transfer(external_host, job, submitter='submitter', timeout=None, log
                                                   files=job['files'],
                                                   transfertool=transfertool,
                                                   job_params=job['job_params'],
-                                                  timeout=timeout)
+                                                  timeout=timeout,
+                                                  vo=vo)
         duration = time.time() - start_time
-        logger(logging.INFO, 'Submit job %s to %s in %s seconds' % (eid, external_host, duration))
+        if vo:
+            logger(logging.INFO, 'Submit job %s to %s for vo %s in %s seconds' % (eid, external_host, vo, duration))
+        else:
+            logger(logging.INFO, 'Submit job %s to %s in %s seconds' % (eid, external_host, duration))
         record_timer('daemons.conveyor.%s.submit_bulk_transfer.per_file' % submitter, (time.time() - start_time) * 1000 / len(job['files']))
         record_counter('daemons.conveyor.%s.submit_bulk_transfer' % submitter, len(job['files']))
         record_timer('daemons.conveyor.%s.submit_bulk_transfer.files' % submitter, len(job['files']))
@@ -274,10 +278,10 @@ def bulk_group_transfers_for_fts(transfers, policy='rule', group_bulk=200, sourc
     :param logger:                   Optional decorated logger that can be passed from the calling daemons or servers.
     :return:                         List of grouped transfers.
     """
-
+    # TODO Implement sorting of VO to be passed on
     grouped_transfers = {}
     grouped_jobs = {}
-
+    
     try:
         default_source_strategy = get(section='conveyor', option='default-source-strategy')
     except ConfigNotFound:

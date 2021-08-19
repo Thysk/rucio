@@ -558,7 +558,7 @@ def checksum_validation_strategy(src_attributes, dst_attributes, logger):
     return verify_checksum, checksums_to_use
 
 
-def submit_bulk_transfers(external_host, files, transfertool='fts3', job_params={}, timeout=None, logger=logging.log):
+def submit_bulk_transfers(external_host, files, transfertool='fts3', job_params={}, timeout=None, logger=logging.log, vo=None):
     """
     Submit transfer request to a transfertool.
     :param external_host:  External host name as string
@@ -605,7 +605,7 @@ def submit_bulk_transfers(external_host, files, transfertool='fts3', job_params=
                 if 'token' in token_dict:
                     logger(logging.DEBUG, 'Access token used as transfer token.')
                     transfer_token = token_dict['token']
-        transfer_id = FTS3Transfertool(external_host=external_host, token=transfer_token).submit(files=job_files, job_params=job_params, timeout=timeout)
+        transfer_id = FTS3Transfertool(external_host=external_host, token=transfer_token, vo=vo).submit(files=job_files, job_params=job_params, timeout=timeout)
         record_timer('core.request.submit_transfers_fts3', (time.time() - start_time) * 1000 / len(files))
     elif transfertool == 'globus':
         logger(logging.DEBUG, '... Starting globus xfer ...')
